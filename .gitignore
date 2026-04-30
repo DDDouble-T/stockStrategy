@@ -1,0 +1,12 @@
+module/config/local_tushare_config.py
+stockProcessor/module/config/local_tushare_config.py
+
+# macOS metadata
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# JetBrains IDE project files
+.idea/
