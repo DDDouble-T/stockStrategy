@@ -3,6 +3,7 @@ import tushare as ts
 from datetime import datetime
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+import os
 import time
 from constants import *
 from module.config import tushare_config
@@ -36,6 +37,7 @@ def map_with_minute_limit(func, iterable, max_per_minute):
 
 
 def save_hdf5(filename, df, key):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     hdf5 = pd.HDFStore(filename, "w")
     hdf5.open()
     hdf5[key] = df
@@ -126,9 +128,9 @@ def multiple_stocks(tickers, start_date, end_date, func):
 
 if __name__ == '__main__':
     print(ts.__version__)
-    stock_basic_df = load_hdf5("data/stock_basic.h5", 'stock_basic')
+    stock_basic_df = load_hdf5(data_path("stock_basic.h5"), 'stock_basic')
     my_tickers = stock_basic_df['ts_code']
-    file_name = "data/daily_" + START_DATE + "_" + END_DATE + ".h5"
+    file_name = data_path("daily_" + START_DATE + "_" + END_DATE + ".h5")
     all_stocks = multiple_stocks(my_tickers, START_DATE, END_DATE, daily_api)
     save_hdf5(file_name, all_stocks, 'data')
     #

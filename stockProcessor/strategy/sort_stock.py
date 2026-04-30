@@ -1,13 +1,15 @@
 import pandas as pd
 import csv
+import os
+from constants import data_path, result_path
 
 
 if __name__ == '__main__':
-    hdf5 = pd.HDFStore("../data/daily_20250421_20250430.h5","r")
+    hdf5 = pd.HDFStore(data_path("daily_20250421_20250430.h5"),"r")
     all_stocks = hdf5['data']
     hdf5.close()
 
-    hdf5 = pd.HDFStore("../data/stock_basic.h5", "r")
+    hdf5 = pd.HDFStore(data_path("stock_basic.h5"), "r")
     stock_basic_df = hdf5['stock_basic']
     hdf5.close()
 
@@ -49,7 +51,9 @@ if __name__ == '__main__':
             industry
         ])
 
-    with open("../data/sort_stock_20240923_20241010.csv", 'w', newline='') as file:
+    result_file = result_path("sort_stock_20240923_20241010.csv")
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerows(result_list)
 

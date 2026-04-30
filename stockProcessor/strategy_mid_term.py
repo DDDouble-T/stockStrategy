@@ -3,9 +3,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 import csv
 import concurrent.futures
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from constants import *
+from stockProcessor.download.constants import *
 
 
 def map_with_minute_limit(func, iterable, max_per_minute):
@@ -70,7 +71,7 @@ def multiple_stocks(tickers, before_days: int, start_time: datetime):
 
 def calcul_buy_signal(tickers: pd.core.series.Series, start_time: datetime):
     result_dict = {}
-    hdf5 = pd.HDFStore("data/get_k_data_2024-09-22.h5", "r")
+    hdf5 = pd.HDFStore(data_path("get_k_data_2024-09-22.h5"), "r")
     all_stocks = hdf5['get_k_data']
     hdf5.close()
 
@@ -177,7 +178,7 @@ if __name__ == '__main__':
     test_date = datetime.strptime("2024-04-24", "%Y-%m-%d")
 
     # 用今天开始往前120个交易日的数据，计算下一个交易日可以买的股票
-    hdf5 = pd.HDFStore("data/stock_basic.h5", "r")
+    hdf5 = pd.HDFStore(data_path("stock_basic.h5"), "r")
     stock_basic_df = hdf5['stock_basic']
     hdf5.close()
 
@@ -201,7 +202,9 @@ if __name__ == '__main__':
             result_dict['percent_50days_price'],
         ])
 
-    with open("data/buy_result.csv", 'w', newline='') as file:
+    result_file = result_path("buy_result.csv")
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerows(result_list)
 

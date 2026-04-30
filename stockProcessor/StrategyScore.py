@@ -23,13 +23,13 @@ python StrategyScore.py
 
 import os
 from itertools import combinations
-from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
 # 复用你现有 StrategyChoose.py 里的 TuShare 配置、日线缓存、指标计算、股票池等逻辑
 import StrategyChoose as sc
+from stockProcessor.download.constants import data_path, result_path
 
 
 # ======================
@@ -55,9 +55,9 @@ SOFT_MIN_SAMPLE_COUNT = 10
 FULL_SCORE_SAMPLE_COUNT = 30
 
 # 输出文件
-RESULT_XLSX = "scoreResult/strategy_score_result.xlsx"
-DETAIL_CSV = "scoreResult/strategy_score_detail.csv"
-MONEYFLOW_CACHE_CSV = "data/strategy_moneyflow_cache.csv"
+RESULT_XLSX = result_path("strategy_score_result.xlsx")
+DETAIL_CSV = result_path("strategy_score_detail.csv")
+MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
 
 # 是否只测试少数股票。None 表示全市场。
 # TEST_TS_CODES = ["002709.SZ", "000938.SZ"]
@@ -717,6 +717,8 @@ def evaluate_combos(base_df: pd.DataFrame):
 # ======================
 
 def save_outputs(rank_df, period_df, gradient_df, detail_df, base_df):
+    os.makedirs(os.path.dirname(RESULT_XLSX), exist_ok=True)
+
     with pd.ExcelWriter(RESULT_XLSX, engine="openpyxl") as writer:
         rank_df.to_excel(writer, sheet_name="strategy_rank", index=False)
         period_df.to_excel(writer, sheet_name="period_scores", index=False)

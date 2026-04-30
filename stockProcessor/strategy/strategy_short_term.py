@@ -1,10 +1,11 @@
 import pandas as pd
 import datetime
 import csv
+import os
 from constants import *
 
 def calcul_buy_signal(tickers: pd.core.series.Series, code_dict):
-    file_name = "../data/daily_" + START_DATE + "_" + END_DATE + ".h5"
+    file_name = data_path("daily_" + START_DATE + "_" + END_DATE + ".h5")
     hdf5 = pd.HDFStore(file_name, "r")
     all_stocks = hdf5['data']
     hdf5.close()
@@ -72,7 +73,8 @@ def calcul_buy_signal(tickers: pd.core.series.Series, code_dict):
     final_result_list = []
     final_result_list.append(['股票代码', '股票名称', '行业', '最近一个交易日涨幅', '最近一个交易日成交额', '成交额比例'])
     final_result_list = final_result_list + result_list
-    file_name = "../data/sort_daily_" + START_DATE + "_" + END_DATE + ".csv"
+    file_name = result_path("sort_daily_" + START_DATE + "_" + END_DATE + ".csv")
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
     with open(file_name,'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerows(final_result_list)
@@ -83,7 +85,7 @@ def calcul_sell_signal(ticker_dicts: list, start_time: datetime):
 
 
 if __name__ == '__main__':
-    hdf5 = pd.HDFStore("../data/stock_basic.h5", "r")
+    hdf5 = pd.HDFStore(data_path("stock_basic.h5"), "r")
     stock_basic_df = hdf5['stock_basic']
     hdf5.close()
 

@@ -1,8 +1,10 @@
 import tushare as ts
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta
 from module.config import tushare_config
+from constants import result_path
 
 # 初始化Tushare
 pro = ts.pro_api(tushare_config.TuShareConst.TOKEN)
@@ -112,10 +114,12 @@ for _, row in stock_list.iterrows():
 # 展示结果
 result_df = pd.DataFrame(selected)
 print(f"符合条件股票数量（二段上涨、踩均线）: {len(result_df)}")
-result_df.to_csv('result_1.csv', index=False, sep=',', line_terminator='\n', encoding='utf-8')
+result_1_file = result_path("result_1.csv")
+os.makedirs(os.path.dirname(result_1_file), exist_ok=True)
+result_df.to_csv(result_1_file, index=False, sep=',', line_terminator='\n', encoding='utf-8')
 print(result_df)
 
 multihead_result_df = pd.DataFrame(multihead_selected)
-multihead_result_df.to_csv('result_2.csv', index=False, sep=',', line_terminator='\n', encoding='utf-8')
+multihead_result_df.to_csv(result_path("result_2.csv"), index=False, sep=',', line_terminator='\n', encoding='utf-8')
 print(f"符合条件股票数量(二段上涨、踩均线、均线多头): {len(multihead_result_df)}")
 print(multihead_result_df)

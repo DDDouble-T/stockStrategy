@@ -3,7 +3,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import concurrent.futures
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor
+from constants import data_path
 
 
 def parallel_map(func, iterable):
@@ -63,7 +65,9 @@ def multiple_stocks(tickers, before_days: int, start_time: datetime):
 
     result = pd.concat(stock_data, keys=final_tickers, names=['Ticker', 'Date'])
 
-    hdf5 = pd.HDFStore("data/get_k_data_2024-09-22.h5", "w")
+    filename = data_path("get_k_data_2024-09-22.h5")
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    hdf5 = pd.HDFStore(filename, "w")
     hdf5.open()
     hdf5['get_k_data'] = result
     hdf5.close()
@@ -73,7 +77,7 @@ def multiple_stocks(tickers, before_days: int, start_time: datetime):
 
 if __name__ == '__main__':
     now = datetime.now()
-    hdf5 = pd.HDFStore("data/stock_basic.h5", "r")
+    hdf5 = pd.HDFStore(data_path("stock_basic.h5"), "r")
     stock_basic_df = hdf5['stock_basic']
     hdf5.close()
 

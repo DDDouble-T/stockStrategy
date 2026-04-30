@@ -8,7 +8,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from module.basic import basic_api
 from module.config import tushare_config
-from constants import data_path, score_result_path
+from stockProcessor.download.constants import data_path, score_result_path
 import strategy_choose_config
 
 # ======================
@@ -1049,6 +1049,8 @@ def build_display_table(detail_df):
 
 
 def save_display_excel(display_table, filename=RESULT_XLSX):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "策略筛选"

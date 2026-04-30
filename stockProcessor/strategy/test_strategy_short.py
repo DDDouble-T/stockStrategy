@@ -1,12 +1,14 @@
 import pandas as pd
 import datetime
 import csv
+import os
+from constants import data_path, result_path
 
 
 def cal_buy_and_sell():
     industry_num_dict = {}
 
-    hdf5 = pd.HDFStore("../data/stock_basic.h5", "r")
+    hdf5 = pd.HDFStore(data_path("stock_basic.h5"), "r")
     stock_basic_df = hdf5['stock_basic']
     hdf5.close()
 
@@ -17,7 +19,7 @@ def cal_buy_and_sell():
         industry = row['industry']
         code_dict[ts_code] = {'name':name, 'industry':industry}
 
-    hdf5 = pd.HDFStore("../data/daily_20240101_20240925.h5", "r")
+    hdf5 = pd.HDFStore(data_path("daily_20240101_20240925.h5"), "r")
     all_stocks = hdf5['data']
     hdf5.close()
 
@@ -118,7 +120,9 @@ def cal_buy_and_sell():
     final_result_list.append(['股票代码', '股票名称', '行业','交易日','收盘价', '最近一个交易日涨幅', '成交额比例'])
     final_result_list = final_result_list + result_list
 
-    with open("../data/sort_daily_20240101_20240925.csv", 'w', newline='') as file:
+    result_file = result_path("sort_daily_20240101_20240925.csv")
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerows(final_result_list)
 
