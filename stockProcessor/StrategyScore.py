@@ -59,7 +59,6 @@ MIN_COMBO_SIZE = 4
 RESULT_XLSX = result_path("strategy_score_result.xlsx")
 DETAIL_CSV = result_path("strategy_score_detail.csv")
 MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
-DAILY_BASIC_CACHE_CSV = data_path("strategy_daily_basic_cache.csv")
 
 # 是否只测试少数股票。None 表示全市场。
 # TEST_TS_CODES = ["002709.SZ", "000938.SZ"]
@@ -173,74 +172,9 @@ def fetch_with_retry(fetch_func, label):
         raise RuntimeError(f"{label} 下载失败，已停止本次评分，避免使用不完整数据：{e}") from e
 
 
-# ----------------------
-# daily_basic 缓存：换手率、量比、PE 等
-# ----------------------
-
-def load_daily_basic_cache() -> pd.DataFrame:
-    if not os.path.exists(DAILY_BASIC_CACHE_CSV):
-        return pd.DataFrame()
-    df = pd.read_csv(DAILY_BASIC_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
-    if "trade_date" in df.columns:
-        df["trade_date"] = df["trade_date"].astype(str)
-    return df
-
-
-def save_daily_basic_cache(df: pd.DataFrame):
-    os.makedirs(os.path.dirname(DAILY_BASIC_CACHE_CSV), exist_ok=True)
-    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
-    df.to_csv(DAILY_BASIC_CACHE_CSV, index=False, encoding="utf-8-sig")
-
-
-def fetch_daily_basic_by_trade_date(trade_date: str) -> pd.DataFrame:
-    """按交易日拉取全市场 daily_basic。"""
-    pro = sc.pro_api()
-    fields = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm"
-    return pro.daily_basic(trade_date=trade_date, fields=fields)
-
-
-def load_all_basic(ts_codes, trade_dates) -> pd.DataFrame:
-    """
-    加载 daily_basic 缓存。
-    如果你的 StrategyChoose.py 已经有 load_all_basic，则优先复用；否则使用本文件的缓存逻辑。
-    """
-    if hasattr(sc, "load_all_basic"):
-        return sc.load_all_basic(ts_codes, trade_dates)
-
-    cache_df = load_daily_basic_cache()
-    cached_dates = set(cache_df["trade_date"].astype(str)) if not cache_df.empty and "trade_date" in cache_df.columns else set()
-
-    missing_dates = [d for d in trade_dates if d not in cached_dates]
-    if missing_dates:
-        print(f"daily_basic 缓存缺失 {len(missing_dates)} 个交易日，开始补齐")
-
-    fetched = []
-    for trade_date in missing_dates:
-        df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_daily_basic_by_trade_date(trade_date),
-            f"daily_basic {trade_date}"
-        )
-        if df.empty:
-            raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次评分，避免使用不完整数据")
-        df["trade_date"] = df["trade_date"].astype(str)
-        fetched.append(df)
-        print(f"已补齐 daily_basic 数据：{trade_date}")
-
-    if fetched:
-        cache_df = pd.concat([cache_df] + fetched, ignore_index=True)
-        save_daily_basic_cache(cache_df)
-
-    if cache_df.empty:
-        return pd.DataFrame()
-
-    ts_code_set = set(ts_codes)
-    trade_date_set = set(trade_dates)
-    result = cache_df[
-        cache_df["ts_code"].isin(ts_code_set)
-        & cache_df["trade_date"].isin(trade_date_set)
-    ].copy()
-    return result
+def load_all_basic(ts_codes, trade_dates, daily_df=None) -> pd.DataFrame:
+    """统一复用 StrategyChoose 的基础面缓存与补齐逻辑。"""
+    return sc.load_all_basic(ts_codes, trade_dates, daily_df=daily_df)
 
 
 # ----------------------
@@ -1000,7 +934,7 @@ def main():
         print("没有获取到日线数据")
         return
 
-    all_basic = load_all_basic(ts_codes, trade_dates)
+    all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
     if not all_basic.empty:
         all_daily = all_daily.merge(
             all_basic,

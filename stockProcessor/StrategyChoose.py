@@ -403,14 +403,43 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
     cache_df = load_basic_cache()
     required_columns = {"ts_code", "trade_date", "eps", "volume_ratio", "turnover_rate", "pe"}
     cache_has_required_columns = required_columns.issubset(set(cache_df.columns))
-    cached_dates = (
-        set(cache_df["trade_date"].astype(str))
-        if cache_has_required_columns and not cache_df.empty and "trade_date" in cache_df.columns
-        else set()
-    )
-    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in cached_dates]
+    valid_cached_dates = set()
+    invalid_cached_dates = []
+    expected_counts = {}
+    if daily_df is not None and not daily_df.empty and "trade_date" in daily_df.columns:
+        expected_counts = (
+            daily_df.assign(trade_date=daily_df["trade_date"].astype(str))
+            .groupby("trade_date")["ts_code"]
+            .nunique()
+            .to_dict()
+        )
+    if cache_has_required_columns and not cache_df.empty and "trade_date" in cache_df.columns:
+        trade_date_cache = cache_df["trade_date"].astype(str)
+        for trade_date in trade_dates:
+            date_df = cache_df[trade_date_cache == trade_date]
+            if date_df.empty:
+                continue
+
+            # 仅按“日期存在”判断缓存命中是不够的。
+            # 历史上出现过某个交易日缓存里 eps 全空的情况，这会让整天样本被错误过滤。
+            eps_ready = date_df["eps"].notna().any()
+            daily_basic_ready = date_df[["volume_ratio", "turnover_rate", "pe"]].notna().any(axis=0).all()
+            expected_count = expected_counts.get(trade_date)
+            coverage_ready = True
+            if expected_count:
+                coverage_ready = date_df["ts_code"].nunique() >= max(1, int(expected_count * 0.9))
+
+            if eps_ready and daily_basic_ready and coverage_ready:
+                valid_cached_dates.add(trade_date)
+            else:
+                invalid_cached_dates.append(trade_date)
+
+    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in valid_cached_dates]
     if missing_dates:
-        print(f"基础面缓存缺失 {len(missing_dates)} 个交易日，开始补齐：{', '.join(missing_dates)}")
+        message = f"基础面缓存缺失或不完整 {len(missing_dates)} 个交易日，开始补齐：{', '.join(missing_dates)}"
+        if invalid_cached_dates:
+            message += f"；其中缓存不完整日期：{', '.join(invalid_cached_dates)}"
+        print(message)
     else:
         print(f"基础面缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取")
 
@@ -837,7 +866,7 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     all_daily = load_all_daily(ts_codes, trade_dates)
     if all_daily.empty:
         return pd.DataFrame()
-    all_basic = load_all_basic(ts_codes, trade_dates)
+    all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
     if not all_basic.empty:
         all_daily = all_daily.merge(
             all_basic,
