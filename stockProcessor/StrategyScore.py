@@ -90,7 +90,7 @@ MAX_TURNOVER_RATE = getattr(sc, "MAX_TURNOVER_RATE", 12.0)
 MIN_PE = getattr(sc, "MIN_PE", 0.0)
 MAX_PE = getattr(sc, "MAX_PE", 80.0)
 
-# 内外盘/主动买卖强度：使用 moneyflow 的买卖量近似，不建议设太高。
+# 内外盘/主动买卖强度：用大单+特大单买卖量近似，避免全量买卖天然接近平衡。
 MIN_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MIN_EXTERNAL_INTERNAL_RATIO", 1.05)
 MAX_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MAX_EXTERNAL_INTERNAL_RATIO", 2.50)
 
@@ -127,7 +127,6 @@ BUCKET_LABELS = ["<=-10%", "-10~-5%", "-5~-3%", "-3~0%", "0~3%", "3~5%", "5~10%"
 # 这里默认不加入 prev_year_high_dividend，因为你这次描述的策略没有包含分红条件。
 # 分红偏基本面，和 3/10/20/30 个交易日的短中线表现不一定强相关。
 CONDITION_KEYS = [
-    "trend_above_ma20",              # 股价在20日均线之上
     "bullish_ma_alignment",          # 5日 > 10日 > 20日
     "volume_rule",                   # 上涨放量或回调缩量
     "position_rule",                 # 回踩10/20日线缩量，或突破前高放量
@@ -304,9 +303,9 @@ def load_all_moneyflow(trade_dates):
     if cache_df.empty:
         return pd.DataFrame(columns=["ts_code", "trade_date", "external_internal_ratio", "main_net", "main_inflow_2days"])
 
-    # 主力净流入：大单 + 特大单买入 - 大单 + 特大单卖出
-    buy_vol_columns = ["buy_sm_vol", "buy_md_vol", "buy_lg_vol", "buy_elg_vol"]
-    sell_vol_columns = ["sell_sm_vol", "sell_md_vol", "sell_lg_vol", "sell_elg_vol"]
+    # 主力口径：大单 + 特大单。全量买卖合计天然接近平衡，不适合做内外盘强弱过滤。
+    buy_vol_columns = ["buy_lg_vol", "buy_elg_vol"]
+    sell_vol_columns = ["sell_lg_vol", "sell_elg_vol"]
     amount_columns = ["buy_lg_amount", "buy_elg_amount", "sell_lg_amount", "sell_elg_amount"]
     for col in buy_vol_columns + sell_vol_columns + amount_columns:
         if col not in cache_df.columns:
