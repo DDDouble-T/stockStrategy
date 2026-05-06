@@ -119,14 +119,24 @@ def get_latest_completed_trade_date(now=None):
         raise ValueError("未获取到可用交易日，请检查交易日历接口")
 
     if trade_dates[-1] != today:
-        return trade_dates[-1]
+        candidate_dates = trade_dates
+    elif now.hour >= MARKET_CLOSE_HOUR:
+        candidate_dates = trade_dates
+    else:
+        if len(trade_dates) < 2:
+            raise ValueError("当前交易日未结束，且没有可用的上一交易日")
+        candidate_dates = trade_dates[:-1]
 
-    if now.hour >= MARKET_CLOSE_HOUR:
-        return today
+    # TuShare daily 数据可能晚于收盘时间发布。必须确认数据已经可用，
+    # 否则会把“交易日历已结束但行情未发布”的日期带入后续计算。
+    for trade_date in reversed(candidate_dates):
+        daily_df = pro.daily(trade_date=trade_date)
+        if not daily_df.empty:
+            if trade_date != candidate_dates[-1]:
+                print(f"最近交易日 {candidate_dates[-1]} daily 数据未就绪，回退到 {trade_date}")
+            return trade_date
 
-    if len(trade_dates) < 2:
-        raise ValueError("当前交易日未结束，且没有可用的上一交易日")
-    return trade_dates[-2]
+    raise ValueError("最近交易日均未获取到 daily 数据，请检查 TuShare daily 接口")
 
 
 def calc_rsi(close, period=6):

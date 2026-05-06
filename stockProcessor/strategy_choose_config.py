@@ -51,17 +51,17 @@ DEFAULT_CONFIG = {
     "conditions": {
         "trend_above_ma20": False,
         "bullish_ma_alignment": True,
-        "volume_rule": False,
+        "volume_rule": True,
         "position_rule": True,
-        "macd_golden_cross": True,
+        "macd_golden_cross": False,
         "rsi_not_overheated": True,
         "volume_ratio_high": True,
-        "external_internal_ratio_high": True,
+        "external_internal_ratio_high": False,
         "turnover_rate_range": True,
         "pe_reasonable": True,
-        "social_security_holder": True,
+        "social_security_holder": False,
         "prev_year_high_dividend": False,
-        "main_money_inflow_2days": False,
+        "main_money_inflow_2days": True,
     },
 }
 
