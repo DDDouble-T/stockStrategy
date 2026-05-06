@@ -218,7 +218,6 @@ def load_all_moneyflow(trade_dates):
     if missing_dates:
         print(f"资金流缓存缺失 {len(missing_dates)} 个交易日，开始补齐")
 
-    fetched = []
     for trade_date in missing_dates:
         df = fetch_with_retry(
             lambda trade_date=trade_date: fetch_moneyflow_by_trade_date(trade_date),
@@ -227,12 +226,9 @@ def load_all_moneyflow(trade_dates):
         if df.empty:
             raise RuntimeError(f"moneyflow {trade_date} 返回空数据，已停止本次评分，避免使用不完整数据")
         df["trade_date"] = df["trade_date"].astype(str)
-        fetched.append(df)
-        print(f"已补齐资金流数据：{trade_date}")
-
-    if fetched:
-        cache_df = pd.concat([cache_df] + fetched, ignore_index=True)
+        cache_df = pd.concat([cache_df, df], ignore_index=True)
         save_moneyflow_cache(cache_df)
+        print(f"已补齐资金流数据：{trade_date}")
 
     if cache_df.empty:
         return pd.DataFrame(columns=["ts_code", "trade_date", "external_internal_ratio", "main_net", "main_inflow_2days"])

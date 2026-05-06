@@ -1,6 +1,7 @@
 import pandas as pd
 import tushare as ts
 import os
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from openpyxl import Workbook
@@ -57,6 +58,8 @@ MIN_EXTERNAL_INTERNAL_RATIO = RUNTIME_CONFIG["min_external_internal_ratio"]
 MIN_TURNOVER_RATE = RUNTIME_CONFIG["min_turnover_rate"]
 MAX_TURNOVER_RATE = RUNTIME_CONFIG["max_turnover_rate"]
 MAX_PE = RUNTIME_CONFIG["max_pe"]
+BAK_BASIC_MIN_INTERVAL_SECONDS = 30
+LAST_BAK_BASIC_FETCH_TS = None
 
 CONDITION_NAMES = {
     "trend_above_ma20": "股价在20日线之上",
@@ -277,7 +280,6 @@ def load_all_moneyflow(trade_dates):
     else:
         print(f"资金流缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取")
 
-    fetched = []
     for trade_date in missing_dates:
         df = fetch_with_retry(
             lambda trade_date=trade_date: fetch_moneyflow_by_trade_date(trade_date),
@@ -286,12 +288,9 @@ def load_all_moneyflow(trade_dates):
         if df.empty:
             raise RuntimeError(f"moneyflow {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
         df["trade_date"] = df["trade_date"].astype(str)
-        fetched.append(df)
-        print(f"已补齐资金流数据：{trade_date}")
-
-    if fetched:
-        cache_df = pd.concat([cache_df] + fetched, ignore_index=True)
+        cache_df = pd.concat([cache_df, df], ignore_index=True)
         save_moneyflow_cache(cache_df)
+        print(f"已补齐资金流数据：{trade_date}")
 
     columns = ["ts_code", "trade_date", "external_internal_ratio", "main_net", "main_inflow_2days"]
     if cache_df.empty:
@@ -358,6 +357,21 @@ def fetch_daily_basic_by_trade_date(trade_date):
 def fetch_bak_basic_by_trade_date(trade_date):
     pro = pro_api()
     return pro.bak_basic(trade_date=trade_date)
+
+
+def fetch_bak_basic_by_trade_date_with_limit(trade_date):
+    global LAST_BAK_BASIC_FETCH_TS
+
+    if LAST_BAK_BASIC_FETCH_TS is not None:
+        elapsed = time.time() - LAST_BAK_BASIC_FETCH_TS
+        wait_seconds = BAK_BASIC_MIN_INTERVAL_SECONDS - elapsed
+        if wait_seconds > 0:
+            print(f"bak_basic 限频等待 {wait_seconds:.1f} 秒：{trade_date}")
+            time.sleep(wait_seconds)
+
+    df = fetch_bak_basic_by_trade_date(trade_date)
+    LAST_BAK_BASIC_FETCH_TS = time.time()
+    return df
 
 
 def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
@@ -443,7 +457,6 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
     else:
         print(f"基础面缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取")
 
-    fetched = []
     for trade_date in missing_dates:
         daily_basic_df = fetch_with_retry(
             lambda trade_date=trade_date: fetch_daily_basic_by_trade_date(trade_date),
@@ -452,7 +465,7 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         if daily_basic_df.empty:
             raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
         bak_basic_df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_bak_basic_by_trade_date(trade_date),
+            lambda trade_date=trade_date: fetch_bak_basic_by_trade_date_with_limit(trade_date),
             f"bak_basic {trade_date}"
         )
         if bak_basic_df.empty:
@@ -460,12 +473,9 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
 
         merged = merge_basic_frames(daily_basic_df, bak_basic_df, trade_date)
         if not merged.empty:
-            fetched.append(merged)
+            cache_df = pd.concat([cache_df, merged], ignore_index=True)
+            save_basic_cache(cache_df)
             print(f"已补齐基础面数据：{trade_date}")
-
-    if fetched:
-        cache_df = pd.concat([cache_df] + fetched, ignore_index=True)
-        save_basic_cache(cache_df)
 
     if cache_df.empty:
         return pd.DataFrame(columns=["ts_code", "trade_date", "eps", "volume_ratio", "turnover_rate", "pe"])
@@ -636,7 +646,6 @@ def load_all_daily(ts_codes, trade_dates):
     else:
         print(f"日线缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取 daily")
 
-    fetched_list = []
     for trade_date in missing_dates:
         df = fetch_with_retry(
             lambda trade_date=trade_date: fetch_daily_by_trade_date(trade_date),
@@ -645,12 +654,9 @@ def load_all_daily(ts_codes, trade_dates):
         if df.empty:
             raise RuntimeError(f"daily {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
         df["trade_date"] = df["trade_date"].astype(str)
-        fetched_list.append(df)
-        print(f"已补齐日线数据：{trade_date}")
-
-    if fetched_list:
-        cache_df = pd.concat([cache_df] + fetched_list, ignore_index=True)
+        cache_df = pd.concat([cache_df, df], ignore_index=True)
         save_daily_cache(cache_df)
+        print(f"已补齐日线数据：{trade_date}")
 
     if cache_df.empty:
         return pd.DataFrame()
