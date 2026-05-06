@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "prev_year_min_cash_div_tax": 1.0,
     # 每股收益 EPS 基础过滤下限。
     "min_eps": 0.2,
-    # 换手量比下限。
+    # 量比下限。
     "min_volume_ratio": 1.0,
     # 外盘 / 内盘下限；外盘按 moneyflow 主动买入成交量合计，内盘按主动卖出成交量合计。
     "min_external_internal_ratio": 1.05,

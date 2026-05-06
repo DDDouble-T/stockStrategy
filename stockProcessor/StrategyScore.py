@@ -12,7 +12,11 @@ StrategyScore.py
 - period_scores 同时输出 raw_score 与 score；
 - raw_score 可以为负，用于总分与排名；
 - score = max(0, raw_score)，仅用于展示；
-- 回撤惩罚采用“周期容忍回撤”机制，只惩罚超过正常波动的部分。
+- 回撤惩罚采用“周期容忍回撤”机制，只惩罚超过正常波动的部分；
+- 不再鼓励大样本：新增“筛选密度惩罚”，筛出太多股票会扣分；
+- 筛选密度分母使用 EPS 基础过滤 + ST/BJ 过滤之后的候选信号池；
+- 样本惩罚仅保留极小样本轻惩罚，避免精选策略被大幅压分；
+- 收益分权重上调，让策略排名更偏向真实收益兑现能力。
 
 放置位置：
 建议和 StrategyChoose.py、strategy_choose_config.py 放在同一目录下运行。
@@ -23,6 +27,7 @@ python StrategyScore.py
 
 import os
 from itertools import combinations
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -48,16 +53,13 @@ BACKTEST_SIGNAL_DAYS = 120
 WARMUP_TRADE_DAYS = 80
 
 # 组合至少包含几个条件。你说的是“每三个及以上”。
-MIN_COMBO_SIZE = 3
-
-# 样本数建议门槛。先跑可以低一点；后续稳定后建议提高到 30/50。
-SOFT_MIN_SAMPLE_COUNT = 10
-FULL_SCORE_SAMPLE_COUNT = 30
+MIN_COMBO_SIZE = 4
 
 # 输出文件
 RESULT_XLSX = result_path("strategy_score_result.xlsx")
 DETAIL_CSV = result_path("strategy_score_detail.csv")
 MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
+DAILY_BASIC_CACHE_CSV = data_path("strategy_daily_basic_cache.csv")
 
 # 是否只测试少数股票。None 表示全市场。
 # TEST_TS_CODES = ["002709.SZ", "000938.SZ"]
@@ -68,6 +70,38 @@ EXCLUDE_ST = True
 
 # 是否排除北交所。TuShare ts_code 后缀一般为 .BJ。先跑全市场慢的话可以开启。
 EXCLUDE_BJ = True
+
+# ----------------------
+# 基础过滤 / 交易热度阈值
+# ----------------------
+# EPS 和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
+# EPS 如果 daily_basic 没直接给，会用 close / pe_ttm 或 close / pe 粗略反推。
+MIN_EPS = getattr(sc, "MIN_EPS", 0.0)
+
+# 量比：过低代表不活跃，过高可能是高潮或异常。先用宽松区间。
+MIN_VOLUME_RATIO = getattr(sc, "MIN_VOLUME_RATIO", 0.8)
+MAX_VOLUME_RATIO = getattr(sc, "MAX_VOLUME_RATIO", 3.5)
+
+# 换手率：排除太冷清和太情绪化的票。
+MIN_TURNOVER_RATE = getattr(sc, "MIN_TURNOVER_RATE", 1.0)
+MAX_TURNOVER_RATE = getattr(sc, "MAX_TURNOVER_RATE", 12.0)
+
+# 市盈率：用 pe_ttm 优先，pe 兜底。成长股先不要卡太死。
+MIN_PE = getattr(sc, "MIN_PE", 0.0)
+MAX_PE = getattr(sc, "MAX_PE", 80.0)
+
+# 内外盘/主动买卖强度：使用 moneyflow 的买卖量近似，不建议设太高。
+MIN_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MIN_EXTERNAL_INTERNAL_RATIO", 1.05)
+MAX_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MAX_EXTERNAL_INTERNAL_RATIO", 2.50)
+
+# ----------------------
+# 筛选密度惩罚
+# ----------------------
+# selection_rate = 当前策略命中样本数 / EPS+ST过滤后的候选信号总数。
+# 例如 5000只股票 * 120个信号日，经 EPS/ST 过滤后可能剩 420000 行候选信号。
+# 如果某组合命中 20000 行，selection_rate≈4.76%，说明太宽，会扣分。
+TARGET_SELECTION_RATE = 0.005   # <=0.5%：精选，不扣分
+MAX_OK_SELECTION_RATE = 0.02    # 0.5%~2%：轻扣；>2%：明显扣分
 
 # 周期权重：最终 total_raw_score 会按这个权重加权。
 # 你的策略是一周到一个月，所以 10/20 日权重最高；5 日贴近一周；30 日用于观察延续性。
@@ -93,18 +127,18 @@ BUCKET_LABELS = ["<=-10%", "-10~-5%", "-5~-3%", "-3~0%", "0~3%", "3~5%", "5~10%"
 # 这里默认不加入 prev_year_high_dividend，因为你这次描述的策略没有包含分红条件。
 # 分红偏基本面，和 3/10/20/30 个交易日的短中线表现不一定强相关。
 CONDITION_KEYS = [
-    "trend_above_ma20",          # 股价在20日均线之上
-    "bullish_ma_alignment",     # 5日 > 10日 > 20日
-    "volume_rule",              # 上涨放量或回调缩量
-    "position_rule",            # 回踩10/20日线缩量，或突破前高放量
-    "macd_golden_cross",        # MACD金叉
-    "rsi_not_overheated",       # RSI < 70
-    "volume_ratio_high",        # 换手量比达标
+    "trend_above_ma20",              # 股价在20日均线之上
+    "bullish_ma_alignment",          # 5日 > 10日 > 20日
+    "volume_rule",                   # 上涨放量或回调缩量
+    "position_rule",                 # 回踩10/20日线缩量，或突破前高放量
+    "macd_golden_cross",             # MACD金叉
+    "rsi_not_overheated",            # RSI < 70
+    "volume_ratio_high",             # 量比达标
     "external_internal_ratio_high",  # 外盘 / 内盘达标
-    "turnover_rate_range",      # 换手率在合理区间
-    "pe_reasonable",            # 市盈率合理
-    "social_security_holder",   # 股东成分包含全国社保基金
-    "main_money_inflow_2days",  # 主力资金连续流入2天
+    "turnover_rate_range",           # 换手率在合理区间
+    "pe_reasonable",                 # 市盈率合理
+    "social_security_holder",        # 股东成分包含全国社保基金（如果 StrategyChoose 支持）
+    "main_money_inflow_2days",       # 主力资金连续流入2天
 ]
 
 CONDITION_NAME = {
@@ -114,7 +148,7 @@ CONDITION_NAME = {
     "position_rule": "回踩缩量/突破放量",
     "macd_golden_cross": "MACD金叉",
     "rsi_not_overheated": "RSI不过热",
-    "volume_ratio_high": "换手量比达标",
+    "volume_ratio_high": "量比合理",
     "external_internal_ratio_high": "外盘/内盘达标",
     "turnover_rate_range": "换手率合理",
     "pe_reasonable": "市盈率合理",
@@ -132,6 +166,87 @@ def get_score_trade_dates(end_date: str):
     total_days = WARMUP_TRADE_DAYS + BACKTEST_SIGNAL_DAYS + max(FORWARD_DAYS) + 5
     return sc.get_trade_dates(end_date, count=total_days)
 
+
+def fetch_with_retry(fetch_func, label):
+    try:
+        return fetch_func()
+    except Exception as e:
+        raise RuntimeError(f"{label} 下载失败，已停止本次评分，避免使用不完整数据：{e}") from e
+
+
+# ----------------------
+# daily_basic 缓存：换手率、量比、PE 等
+# ----------------------
+
+def load_daily_basic_cache() -> pd.DataFrame:
+    if not os.path.exists(DAILY_BASIC_CACHE_CSV):
+        return pd.DataFrame()
+    df = pd.read_csv(DAILY_BASIC_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
+    if "trade_date" in df.columns:
+        df["trade_date"] = df["trade_date"].astype(str)
+    return df
+
+
+def save_daily_basic_cache(df: pd.DataFrame):
+    os.makedirs(os.path.dirname(DAILY_BASIC_CACHE_CSV), exist_ok=True)
+    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+    df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
+    df.to_csv(DAILY_BASIC_CACHE_CSV, index=False, encoding="utf-8-sig")
+
+
+def fetch_daily_basic_by_trade_date(trade_date: str) -> pd.DataFrame:
+    """按交易日拉取全市场 daily_basic。"""
+    pro = sc.pro_api()
+    fields = "ts_code,trade_date,turnover_rate,volume_ratio,pe,pe_ttm"
+    return pro.daily_basic(trade_date=trade_date, fields=fields)
+
+
+def load_all_basic(ts_codes, trade_dates) -> pd.DataFrame:
+    """
+    加载 daily_basic 缓存。
+    如果你的 StrategyChoose.py 已经有 load_all_basic，则优先复用；否则使用本文件的缓存逻辑。
+    """
+    if hasattr(sc, "load_all_basic"):
+        return sc.load_all_basic(ts_codes, trade_dates)
+
+    cache_df = load_daily_basic_cache()
+    cached_dates = set(cache_df["trade_date"].astype(str)) if not cache_df.empty and "trade_date" in cache_df.columns else set()
+
+    missing_dates = [d for d in trade_dates if d not in cached_dates]
+    if missing_dates:
+        print(f"daily_basic 缓存缺失 {len(missing_dates)} 个交易日，开始补齐")
+
+    fetched = []
+    for trade_date in missing_dates:
+        df = fetch_with_retry(
+            lambda trade_date=trade_date: fetch_daily_basic_by_trade_date(trade_date),
+            f"daily_basic {trade_date}"
+        )
+        if df.empty:
+            raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次评分，避免使用不完整数据")
+        df["trade_date"] = df["trade_date"].astype(str)
+        fetched.append(df)
+        print(f"已补齐 daily_basic 数据：{trade_date}")
+
+    if fetched:
+        cache_df = pd.concat([cache_df] + fetched, ignore_index=True)
+        save_daily_basic_cache(cache_df)
+
+    if cache_df.empty:
+        return pd.DataFrame()
+
+    ts_code_set = set(ts_codes)
+    trade_date_set = set(trade_dates)
+    result = cache_df[
+        cache_df["ts_code"].isin(ts_code_set)
+        & cache_df["trade_date"].isin(trade_date_set)
+    ].copy()
+    return result
+
+
+# ----------------------
+# moneyflow 缓存：主力连续流入、内外盘近似
+# ----------------------
 
 def load_moneyflow_cache() -> pd.DataFrame:
     if not os.path.exists(MONEYFLOW_CACHE_CSV):
@@ -158,17 +273,10 @@ def fetch_moneyflow_by_trade_date(trade_date: str) -> pd.DataFrame:
     return pro.moneyflow(trade_date=trade_date)
 
 
-def fetch_with_retry(fetch_func, label):
-    try:
-        return fetch_func()
-    except Exception as e:
-        raise RuntimeError(f"{label} 下载失败，已停止本次评分，避免使用不完整数据：{e}") from e
-
-
 def load_all_moneyflow(trade_dates):
     """
     加载资金流缓存。只按交易日补齐缺失数据。
-    用于计算“主力资金连续流入2天”。
+    用于计算“主力资金连续流入2天”和“外盘/内盘近似”。
     """
     cache_df = load_moneyflow_cache()
     cached_dates = set(cache_df["trade_date"].astype(str)) if not cache_df.empty and "trade_date" in cache_df.columns else set()
@@ -242,6 +350,37 @@ def load_score_stock_pool():
     return stock_pool.reset_index(drop=True)
 
 
+def load_shareholder_cache_safe():
+    if hasattr(sc, "load_shareholder_cache"):
+        return sc.load_shareholder_cache()
+    return pd.DataFrame()
+
+
+def save_shareholder_cache_safe(df: pd.DataFrame):
+    if hasattr(sc, "save_shareholder_cache"):
+        return sc.save_shareholder_cache(df)
+    return None
+
+
+def get_social_security_holder_flag_safe(ts_code: str, shareholder_cache_ref: dict) -> bool:
+    """
+    如果 StrategyChoose.py 支持全国社保基金股东缓存，就复用；否则默认 False。
+    默认 False 的效果：包含 social_security_holder 的组合不会命中，但不影响其他组合。
+    """
+    if hasattr(sc, "get_social_security_holder_flag"):
+        try:
+            return bool(sc.get_social_security_holder_flag(ts_code, shareholder_cache_ref))
+        except Exception:
+            return False
+    return False
+
+
+def ensure_numeric_column(df: pd.DataFrame, col: str):
+    if col not in df.columns:
+        df[col] = pd.NA
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+
 def build_condition_base_df(
     all_daily: pd.DataFrame,
     stock_info: dict,
@@ -256,8 +395,14 @@ def build_condition_base_df(
     行里包含：
     - base_close：筛选日收盘价，作为本次信号验证基准价；
     - 每个单项条件的 True/False；
-    - 第 3/10/20/30 个交易日后的 close/high/low 差值与涨跌幅；
+    - 第 3/5/10/20/30 个交易日后的 close/high/low 差值与涨跌幅；
     - 信号后 1~N 日区间最高/最低，用于评分时衡量冲高能力和回撤风险。
+
+    重要：
+    - ST/BJ 在股票池阶段过滤；
+    - EPS 在这里做基础过滤；
+    - 因此 base_df 的总行数就是“EPS + ST/BJ 过滤之后的候选信号总数”，
+      后续筛选密度惩罚会用它作为分母。
     """
     if all_daily.empty:
         return pd.DataFrame()
@@ -282,13 +427,23 @@ def build_condition_base_df(
             df = df.sort_values("trade_date").reset_index(drop=True)
             name = stock_info.get(ts_code, "")
 
+            # 确保 basic 字段存在并为数值。
+            for col in ["eps", "volume_ratio", "turnover_rate", "pe", "pe_ttm"]:
+                ensure_numeric_column(df, col)
+
+            # 如果 eps 缺失，则用 close / pe_ttm 或 close / pe 反推一个近似 EPS。
+            # 这不是严格财报 EPS，但作为“排除亏损/极差样本”的基础过滤足够实用。
+            pe_ref = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+            eps_estimated = df["close"] / pe_ref.where(pe_ref > 0)
+            df["eps"] = df["eps"].where(df["eps"].notna(), eps_estimated)
+
             # 基础派生列
             df["price_up"] = df["close"] > df["close"].shift(1)
             df["price_down"] = df["close"] < df["close"].shift(1)
             df["vol_up"] = df["vol"] > df["vol_ma5"]
             df["vol_down"] = df["vol"] < df["vol_ma5"]
 
-            # 最近前高：必须 shift(1)，避免把当天 high 算进“前高”，造成未来/当前数据污染。
+            # 最近前高：必须 shift(1)，避免把当天 high 算进“前高”，造成当前数据污染。
             recent_high = df["high"].shift(1).rolling(sc.RECENT_HIGH_LOOKBACK_DAYS).max()
             near_ma10 = (df["close"] - df["ma10"]).abs() / df["ma10"] <= sc.NEAR_MA_THRESHOLD
             near_ma20 = (df["close"] - df["ma20"]).abs() / df["ma20"] <= sc.NEAR_MA_THRESHOLD
@@ -299,25 +454,34 @@ def build_condition_base_df(
             df["position_rule"] = ((near_ma10 | near_ma20) & df["vol_down"]) | ((df["close"] > recent_high) & df["vol_up"])
             df["macd_golden_cross"] = df["macd_gold"].fillna(False)
             df["rsi_not_overheated"] = df["rsi"] < sc.RSI_MAX
-            eps_series = pd.to_numeric(df.get("eps", pd.Series(pd.NA, index=df.index)), errors="coerce")
-            volume_ratio_series = pd.to_numeric(df.get("volume_ratio", pd.Series(pd.NA, index=df.index)), errors="coerce")
-            turnover_rate_series = pd.to_numeric(df.get("turnover_rate", pd.Series(pd.NA, index=df.index)), errors="coerce")
-            pe_series = pd.to_numeric(df.get("pe", pd.Series(pd.NA, index=df.index)), errors="coerce")
-            df["eps_basic_filter"] = eps_series >= sc.MIN_EPS
-            df["volume_ratio_high"] = volume_ratio_series >= sc.MIN_VOLUME_RATIO
+
+            df["eps_basic_filter"] = df["eps"] >= MIN_EPS
+            df["volume_ratio_high"] = (
+                (df["volume_ratio"] >= MIN_VOLUME_RATIO)
+                & (df["volume_ratio"] <= MAX_VOLUME_RATIO)
+            )
+
             external_internal_ratio = [
                 external_internal_ratio_map.get((ts_code, trade_date), pd.NA)
                 for trade_date in df["trade_date"].astype(str)
             ]
             external_internal_ratio = pd.to_numeric(pd.Series(external_internal_ratio, index=df.index), errors="coerce")
-            df["external_internal_ratio_high"] = external_internal_ratio >= sc.MIN_EXTERNAL_INTERNAL_RATIO
-            df["turnover_rate_range"] = (
-                (turnover_rate_series >= sc.MIN_TURNOVER_RATE)
-                & (turnover_rate_series <= sc.MAX_TURNOVER_RATE)
+            df["external_internal_ratio_high"] = (
+                (external_internal_ratio >= MIN_EXTERNAL_INTERNAL_RATIO)
+                & (external_internal_ratio <= MAX_EXTERNAL_INTERNAL_RATIO)
             )
-            df["pe_reasonable"] = (pe_series > 0) & (pe_series <= sc.MAX_PE)
-            holder_flag = sc.get_social_security_holder_flag(ts_code, shareholder_cache_ref)
+
+            df["turnover_rate_range"] = (
+                (df["turnover_rate"] >= MIN_TURNOVER_RATE)
+                & (df["turnover_rate"] <= MAX_TURNOVER_RATE)
+            )
+
+            pe_for_filter = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+            df["pe_reasonable"] = (pe_for_filter > MIN_PE) & (pe_for_filter <= MAX_PE)
+
+            holder_flag = get_social_security_holder_flag_safe(ts_code, shareholder_cache_ref)
             df["social_security_holder"] = holder_flag
+
             df["main_money_inflow_2days"] = [
                 main_inflow_map.get((ts_code, trade_date), False)
                 for trade_date in df["trade_date"].astype(str)
@@ -335,6 +499,8 @@ def build_condition_base_df(
                 base_close = row["close"]
                 if pd.isna(base_close) or base_close <= 0:
                     continue
+
+                # EPS 基础过滤：这里过滤后，base_df 就是“EPS + ST/BJ 过滤后的候选池”。
                 if not bool(row["eps_basic_filter"]):
                     continue
 
@@ -343,6 +509,10 @@ def build_condition_base_df(
                     "name": name,
                     "signal_date": signal_date,
                     "base_close": base_close,
+                    "eps": row.get("eps", pd.NA),
+                    "pe_ref": row.get("pe_ttm", row.get("pe", pd.NA)),
+                    "volume_ratio": row.get("volume_ratio", pd.NA),
+                    "turnover_rate": row.get("turnover_rate", pd.NA),
                 }
 
                 for key in CONDITION_KEYS:
@@ -413,6 +583,45 @@ def combo_to_name(combo):
     return " + ".join(CONDITION_NAME.get(k, k) for k in combo)
 
 
+def calc_small_sample_penalty(sample_count: int) -> float:
+    """
+    极小样本轻惩罚。
+
+    你的目标是“精选少量股票”，所以不再用过去那种 <30 样本就重扣的逻辑。
+    但如果历史样本极少，例如只有 1~4 个，也可能是偶然性很强，所以保留轻惩罚。
+    """
+    if sample_count < 5:
+        return 8.0
+    if sample_count < 10:
+        return 3.0
+    return 0.0
+
+
+def calc_selection_penalty(selection_rate: float) -> float:
+    """
+    筛选密度惩罚。
+
+    selection_rate = 命中样本数 / EPS+ST/BJ 过滤后的候选信号总数。
+
+    设计目标：
+    - 你希望每天筛出的是少量精选票，而不是几百只大样本；
+    - 因此“筛得太多”要扣分；
+    - 筛得少不扣分，但极小历史样本由 calc_small_sample_penalty 轻扣。
+
+    阈值说明：
+    - <=0.5%：精选，不扣；
+    - 0.5%~2%：轻微扣分；
+    - >2%：明显扣分。
+    """
+    if pd.isna(selection_rate) or selection_rate <= 0:
+        return 0.0
+    if selection_rate <= TARGET_SELECTION_RATE:
+        return 0.0
+    if selection_rate <= MAX_OK_SELECTION_RATE:
+        return (selection_rate - TARGET_SELECTION_RATE) * 500.0
+    return 7.5 + (selection_rate - MAX_OK_SELECTION_RATE) * 1000.0
+
+
 def calc_period_score(metric: dict, forward_day: int) -> dict:
     """
     中短线策略评分函数：适合 3/5/10/20/30 个交易日的策略信号验证。
@@ -426,30 +635,26 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
 
     3. 回撤惩罚不是“有回撤就扣很多”，而是“超过可容忍回撤才扣”。
        因为你做的是一周到一个月的短中线，正常回踩并不一定是坏事。
-       比如 20 日周期中，先回撤 -4% 再涨到 +8%，这是可接受的波段形态。
 
-    指标含义：
-    - avg_close_pct：第 N 个交易日收盘收益，代表信号最终兑现能力。
-    - win_rate：第 N 个交易日收盘为正的比例，代表稳定性。
-    - avg_period_high_pct：信号后 1~N 日区间最高收益，代表中途止盈机会。
-    - avg_period_low_pct：信号后 1~N 日区间最低收益，代表持仓过程压力。
-    - std_close_pct：第 N 日收益标准差，代表波动和不确定性。
-    - sample_count：样本数，样本太少会扣分，但不直接剔除，方便你先试跑。
+    4. 样本惩罚只保留“极小样本轻惩罚”。
+       你希望筛出小样本，所以不再鼓励大样本，也不再因为 <30 样本就重扣。
     """
-    sample_count = metric["sample_count"]
+    sample_count = int(metric["sample_count"])
     avg_close_pct = metric["avg_close_pct"]
     win_rate = metric["win_rate"]  # 0~1
     avg_period_high_pct = metric["avg_period_high_pct"]
     avg_period_low_pct = metric["avg_period_low_pct"]
     std_close_pct = metric["std_close_pct"]
 
-    # 收益权重：10/20日是核心，3日只是验证信号是否快速生效，30日看趋势延续。
+    # 收益权重：本版上调收益分比重。
+    # 目的：让排名更偏向“第N日真实收益兑现”，而不是被胜率/冲高/样本数量过度影响。
+    # 10/20日仍是核心，3日只是验证信号短期反应，30日看趋势延续。
     RETURN_WEIGHT_BY_DAY = {
-        3: 4.0,
-        5: 5.0,
-        10: 6.0,
-        20: 7.0,
-        30: 6.0,
+        3: 6.0,
+        5: 7.5,
+        10: 10.0,
+        20: 12.0,
+        30: 10.0,
     }
 
     # 胜率基准：短周期要求略高；20/30日允许胜率略低但收益空间更大。
@@ -504,16 +709,8 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
     # 5. 波动惩罚：收益波动过大，说明策略稳定性差或依赖少数极端样本。
     volatility_penalty = std_close_pct * 0.4
 
-    # 6. 样本惩罚：你说 >30 样本可能比较难，所以这里采用柔性扣分。
-    # <10 明显不稳定，扣多一点；10~20 小扣；20~30 轻微扣；>=30 不扣。
-    if sample_count < 10:
-        sample_penalty = 12.0
-    elif sample_count < 20:
-        sample_penalty = 6.0
-    elif sample_count < 30:
-        sample_penalty = 3.0
-    else:
-        sample_penalty = 0.0
+    # 6. 样本惩罚：只对极小样本轻扣，不再因为 <30 就大幅扣分。
+    sample_penalty = calc_small_sample_penalty(sample_count)
 
     raw_score = (
         return_score
@@ -539,6 +736,7 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
         "excess_drawdown": round(excess_drawdown, 2),
     }
 
+
 def evaluate_combos(base_df: pd.DataFrame):
     """遍历所有组合，计算各周期分数、总分、梯度分布、明细。"""
     combos = generate_condition_combinations()
@@ -548,6 +746,12 @@ def evaluate_combos(base_df: pd.DataFrame):
     rank_rows = []
     gradient_rows = []
     detail_rows = []
+
+    # 这里的分母已经是 EPS + ST/BJ 过滤后的候选信号池。
+    # base_df 每一行 = 某只股票在某个候选信号日。
+    candidate_signal_count = len(base_df)
+    candidate_stock_count = base_df["ts_code"].nunique() if not base_df.empty else 0
+    signal_day_count = base_df["signal_date"].nunique() if not base_df.empty else 0
 
     for combo_index, combo in enumerate(combos, start=1):
         combo_id = f"S{combo_index:03d}"
@@ -560,6 +764,13 @@ def evaluate_combos(base_df: pd.DataFrame):
         combo_df = base_df[mask].copy()
         if combo_df.empty:
             continue
+
+        selection_count = len(combo_df)
+        selected_stock_count = combo_df["ts_code"].nunique()
+        selected_signal_day_count = combo_df["signal_date"].nunique()
+        avg_signals_per_day = selection_count / signal_day_count if signal_day_count else 0
+        selection_rate = selection_count / candidate_signal_count if candidate_signal_count else 0
+        selection_penalty = calc_selection_penalty(selection_rate)
 
         total_raw_score = 0.0
         total_display_score = 0.0
@@ -621,7 +832,7 @@ def evaluate_combos(base_df: pd.DataFrame):
             })
 
             weight = PERIOD_WEIGHTS.get(h, 1 / len(FORWARD_DAYS))
-            # 排名总分使用 raw_score，负分会参与总分；score 只是非负展示分。
+            # 排名总分先使用 raw_score 加权，负分会参与总分；score 只是非负展示分。
             total_raw_score += raw_score * weight
             total_display_score += score * weight
             total_weight += weight
@@ -662,13 +873,27 @@ def evaluate_combos(base_df: pd.DataFrame):
                 })
 
         if total_weight > 0:
+            total_raw = total_raw_score / total_weight
+            total_display = total_display_score / total_weight
+            adjusted_total_raw = total_raw - selection_penalty
+
             rank_rows.append({
                 "combo_id": combo_id,
                 "combo_size": len(combo),
                 "conditions": combo_name,
+                "candidate_stock_count_after_eps_st": candidate_stock_count,
+                "candidate_signal_count_after_eps_st": candidate_signal_count,
+                "signal_day_count": signal_day_count,
+                "selection_count": selection_count,
+                "selected_stock_count": selected_stock_count,
+                "selected_signal_day_count": selected_signal_day_count,
+                "avg_signals_per_day": round(avg_signals_per_day, 2),
+                "selection_rate_pct": round(selection_rate * 100, 4),
+                "selection_penalty": round(selection_penalty, 2),
                 "sample_count_max": sample_count_max,
-                "total_raw_score": round(total_raw_score / total_weight, 2),
-                "total_score": round(total_display_score / total_weight, 2),
+                "total_raw_score": round(total_raw, 2),
+                "adjusted_total_raw_score": round(adjusted_total_raw, 2),
+                "total_score": round(total_display, 2),
             })
 
     rank_df = pd.DataFrame(rank_rows)
@@ -706,7 +931,10 @@ def evaluate_combos(base_df: pd.DataFrame):
         rank_df = rank_df.merge(raw_score_pivot, on="combo_id", how="left")
         rank_df = rank_df.merge(score_pivot, on="combo_id", how="left")
         rank_df = rank_df.merge(sample_pivot, on="combo_id", how="left")
-        rank_df = rank_df.sort_values(["total_raw_score", "sample_count_max"], ascending=[False, False]).reset_index(drop=True)
+        rank_df = rank_df.sort_values(
+            ["adjusted_total_raw_score", "total_raw_score", "selection_count"],
+            ascending=[False, False, True]
+        ).reset_index(drop=True)
         rank_df.insert(0, "rank", range(1, len(rank_df) + 1))
 
     return rank_df, period_df, gradient_df, detail_df
@@ -716,13 +944,15 @@ def evaluate_combos(base_df: pd.DataFrame):
 # 导出
 # ======================
 
-def save_outputs(rank_df, period_df, gradient_df, detail_df, base_df):
+def save_outputs(rank_df, period_df, gradient_df, detail_df, base_df, run_summary_df):
     os.makedirs(os.path.dirname(RESULT_XLSX), exist_ok=True)
+    os.makedirs(os.path.dirname(DETAIL_CSV), exist_ok=True)
 
     with pd.ExcelWriter(RESULT_XLSX, engine="openpyxl") as writer:
         rank_df.to_excel(writer, sheet_name="strategy_rank", index=False)
         period_df.to_excel(writer, sheet_name="period_scores", index=False)
         gradient_df.to_excel(writer, sheet_name="gradient", index=False)
+        run_summary_df.to_excel(writer, sheet_name="run_summary", index=False)
 
         # 明细表可能非常大，Excel 单表最多 1048576 行；超出则只写前 100 万，完整明细写 CSV。
         if len(detail_df) <= 1_000_000:
@@ -737,7 +967,7 @@ def save_outputs(rank_df, period_df, gradient_df, detail_df, base_df):
                 "condition": key,
                 "name": CONDITION_NAME.get(key, key),
                 "pass_count": int(base_df[key].sum()) if not base_df.empty else 0,
-                "total_count": len(base_df),
+                "total_count_after_eps_st": len(base_df),
                 "pass_rate_pct": round(base_df[key].mean() * 100, 2) if not base_df.empty else 0,
             })
         pd.DataFrame(condition_stats).to_excel(writer, sheet_name="condition_stats", index=False)
@@ -764,24 +994,25 @@ def main():
     stock_pool = load_score_stock_pool()
     stock_info = {row["ts_code"]: row["name"] for _, row in stock_pool.iterrows()}
     ts_codes = list(stock_info.keys())
-    print(f"股票池数量：{len(ts_codes)}")
+    print(f"股票池数量（ST/BJ过滤后，EPS过滤前）：{len(ts_codes)}")
 
     all_daily = sc.load_all_daily(ts_codes, trade_dates)
     if all_daily.empty:
         print("没有获取到日线数据")
         return
-    all_basic = sc.load_all_basic(ts_codes, trade_dates)
+
+    all_basic = load_all_basic(ts_codes, trade_dates)
     if not all_basic.empty:
         all_daily = all_daily.merge(
             all_basic,
             on=["ts_code", "trade_date"],
             how="left"
         )
-    for col in ["eps", "volume_ratio", "turnover_rate", "pe"]:
+    for col in ["eps", "volume_ratio", "turnover_rate", "pe", "pe_ttm"]:
         if col not in all_daily.columns:
             all_daily[col] = pd.NA
 
-    # 只要条件组合里包含资金流相关条件，就需要资金流预计算。
+    # 只要条件组合里包含资金流/内外盘相关条件，就需要资金流预计算。
     moneyflow_df = pd.DataFrame()
     if "main_money_inflow_2days" in CONDITION_KEYS or "external_internal_ratio_high" in CONDITION_KEYS:
         # 需要覆盖候选信号日以及它的前一日。
@@ -790,8 +1021,8 @@ def main():
         moneyflow_df = load_all_moneyflow(moneyflow_dates)
 
     shareholder_cache_ref = {
-        "df": sc.load_shareholder_cache(),
-        "dirty": False
+        "df": load_shareholder_cache_safe(),
+        "dirty": False,
     }
 
     base_df = build_condition_base_df(
@@ -799,16 +1030,25 @@ def main():
         stock_info,
         signal_dates,
         moneyflow_df,
-        shareholder_cache_ref
+        shareholder_cache_ref,
     )
     if base_df.empty:
-        print("没有生成候选信号表，请检查数据窗口或股票池")
+        print("没有生成候选信号表，请检查数据窗口、EPS过滤、ST过滤或股票池")
         return
 
-    if shareholder_cache_ref["dirty"]:
-        sc.save_shareholder_cache(shareholder_cache_ref["df"])
+    if shareholder_cache_ref.get("dirty"):
+        save_shareholder_cache_safe(shareholder_cache_ref["df"])
 
-    print(f"候选信号表：{len(base_df)} 行")
+    candidate_stock_count = base_df["ts_code"].nunique()
+    candidate_signal_count = len(base_df)
+    signal_day_count = base_df["signal_date"].nunique()
+    avg_candidate_per_day = candidate_signal_count / signal_day_count if signal_day_count else 0
+
+    print(
+        f"候选信号表：{candidate_signal_count} 行；"
+        f"EPS+ST/BJ过滤后股票数：{candidate_stock_count}；"
+        f"平均每天候选数：{avg_candidate_per_day:.2f}"
+    )
 
     rank_df, period_df, gradient_df, detail_df = evaluate_combos(base_df)
 
@@ -816,7 +1056,33 @@ def main():
         print("没有任何组合产生有效样本")
         return
 
-    save_outputs(rank_df, period_df, gradient_df, detail_df, base_df)
+    run_summary_df = pd.DataFrame([
+        {"key": "end_date", "value": end_date},
+        {"key": "trade_date_start", "value": trade_dates[0]},
+        {"key": "trade_date_end", "value": trade_dates[-1]},
+        {"key": "signal_date_start", "value": signal_dates[0]},
+        {"key": "signal_date_end", "value": signal_dates[-1]},
+        {"key": "forward_days", "value": str(FORWARD_DAYS)},
+        {"key": "return_weight_mode", "value": "收益分权重已上调，排名更偏向真实收益兑现"},
+        {"key": "stock_count_after_st_bj_before_eps", "value": len(ts_codes)},
+        {"key": "stock_count_after_eps_st_bj", "value": candidate_stock_count},
+        {"key": "candidate_signal_count_after_eps_st_bj", "value": candidate_signal_count},
+        {"key": "signal_day_count", "value": signal_day_count},
+        {"key": "avg_candidate_per_day_after_eps_st_bj", "value": round(avg_candidate_per_day, 2)},
+        {"key": "target_selection_rate", "value": TARGET_SELECTION_RATE},
+        {"key": "max_ok_selection_rate", "value": MAX_OK_SELECTION_RATE},
+        {"key": "min_eps", "value": MIN_EPS},
+        {"key": "min_volume_ratio", "value": MIN_VOLUME_RATIO},
+        {"key": "max_volume_ratio", "value": MAX_VOLUME_RATIO},
+        {"key": "min_turnover_rate", "value": MIN_TURNOVER_RATE},
+        {"key": "max_turnover_rate", "value": MAX_TURNOVER_RATE},
+        {"key": "min_pe", "value": MIN_PE},
+        {"key": "max_pe", "value": MAX_PE},
+        {"key": "min_external_internal_ratio", "value": MIN_EXTERNAL_INTERNAL_RATIO},
+        {"key": "max_external_internal_ratio", "value": MAX_EXTERNAL_INTERNAL_RATIO},
+    ])
+
+    save_outputs(rank_df, period_df, gradient_df, detail_df, base_df, run_summary_df)
 
     print("\n===== Top 20 策略组合 =====")
     print(rank_df.head(20).to_string(index=False))
