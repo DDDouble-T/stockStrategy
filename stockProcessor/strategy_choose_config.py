@@ -24,6 +24,11 @@ DEFAULT_CONFIG = {
     "enable_eps_filter": True,
     # 每股收益 EPS 基础过滤下限；仅在 enable_eps_filter 为 True 且 eps 有值时生效。
     "min_eps": 0.2,
+    # 是否启用总市值基础过滤；关闭后不按 total_mv 过滤。
+    "enable_total_mv_filter": True,
+    # 总市值基础过滤下限；开启过滤后，total_mv 缺失视为基础面数据不足。
+    # TuShare daily_basic.total_mv 单位为万元；500000 万元 = 50 亿元。
+    "min_total_mv": 500000.0,
     # 量比下限。
     "min_volume_ratio": 1.0,
     # 外盘 / 内盘下限；外盘按 moneyflow 主动买入成交量合计，内盘按主动卖出成交量合计。

@@ -73,10 +73,12 @@ EXCLUDE_BJ = True
 # ----------------------
 # 基础过滤 / 交易热度阈值
 # ----------------------
-# EPS 和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
+# EPS、总市值和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
 # EPS 如果 daily_basic 没直接给，会用 close / pe_ttm 或 close / pe 粗略反推。
 MIN_EPS = getattr(sc, "MIN_EPS", 0.0)
 EPS_FILTER_ENABLED = getattr(sc, "EPS_FILTER_ENABLED", MIN_EPS is not None)
+MIN_TOTAL_MV = getattr(sc, "MIN_TOTAL_MV", None)
+TOTAL_MV_FILTER_ENABLED = getattr(sc, "TOTAL_MV_FILTER_ENABLED", MIN_TOTAL_MV is not None)
 
 # 量比：过低代表不活跃，过高可能是高潮或异常。先用宽松区间。
 MIN_VOLUME_RATIO = getattr(sc, "MIN_VOLUME_RATIO", 0.8)
@@ -97,8 +99,8 @@ MAX_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MAX_EXTERNAL_INTERNAL_RATIO", 2.50)
 # ----------------------
 # 筛选密度惩罚
 # ----------------------
-# selection_rate = 当前策略命中样本数 / EPS+ST过滤后的候选信号总数。
-# 例如 5000只股票 * 120个信号日，经 EPS/ST 过滤后可能剩 420000 行候选信号。
+# selection_rate = 当前策略命中样本数 / EPS+总市值+ST/BJ过滤后的候选信号总数。
+# 例如 5000只股票 * 120个信号日，经 EPS/总市值/ST/BJ 过滤后可能剩 420000 行候选信号。
 # 如果某组合命中 20000 行，selection_rate≈4.76%，说明太宽，会扣分。
 TARGET_SELECTION_RATE = 0.005   # <=0.5%：精选，不扣分
 MAX_OK_SELECTION_RATE = 0.02    # 0.5%~2%：轻扣；>2%：明显扣分
@@ -330,8 +332,8 @@ def build_condition_base_df(
 
     重要：
     - ST/BJ 在股票池阶段过滤；
-    - EPS 在这里做基础过滤；
-    - 因此 base_df 的总行数就是“EPS + ST/BJ 过滤之后的候选信号总数”，
+    - EPS、总市值在这里做基础过滤；
+    - 因此 base_df 的总行数就是“EPS + 总市值 + ST/BJ 过滤之后的候选信号总数”，
       后续筛选密度惩罚会用它作为分母。
     """
     if all_daily.empty:
@@ -358,7 +360,12 @@ def build_condition_base_df(
             name = stock_info.get(ts_code, "")
 
             # 确保 basic 字段存在并为数值。
-            for col in ["eps", "volume_ratio", "turnover_rate", "pe", "pe_ttm"]:
+            basic_columns = ["volume_ratio", "turnover_rate", "pe", "pe_ttm"]
+            if EPS_FILTER_ENABLED:
+                basic_columns.append("eps")
+            if TOTAL_MV_FILTER_ENABLED:
+                basic_columns.append("total_mv")
+            for col in basic_columns:
                 ensure_numeric_column(df, col)
 
             if EPS_FILTER_ENABLED:
@@ -436,17 +443,22 @@ def build_condition_base_df(
                 # EPS 基础过滤关闭时，缺失 EPS 不会影响候选池。
                 if EPS_FILTER_ENABLED and not bool(row["eps_basic_filter"]):
                     continue
+                if TOTAL_MV_FILTER_ENABLED and (pd.isna(row["total_mv"]) or row["total_mv"] <= MIN_TOTAL_MV):
+                    continue
 
                 item = {
                     "ts_code": ts_code,
                     "name": name,
                     "signal_date": signal_date,
                     "base_close": base_close,
-                    "eps": row.get("eps", pd.NA),
                     "pe_ref": row.get("pe_ttm", row.get("pe", pd.NA)),
                     "volume_ratio": row.get("volume_ratio", pd.NA),
                     "turnover_rate": row.get("turnover_rate", pd.NA),
                 }
+                if EPS_FILTER_ENABLED:
+                    item["eps"] = row.get("eps", pd.NA)
+                if TOTAL_MV_FILTER_ENABLED:
+                    item["total_mv"] = row.get("total_mv", pd.NA)
 
                 for key in CONDITION_KEYS:
                     item[key] = bool(row[key])
@@ -534,7 +546,7 @@ def calc_selection_penalty(selection_rate: float) -> float:
     """
     筛选密度惩罚。
 
-    selection_rate = 命中样本数 / EPS+ST/BJ 过滤后的候选信号总数。
+    selection_rate = 命中样本数 / EPS+总市值+ST/BJ 过滤后的候选信号总数。
 
     设计目标：
     - 你希望每天筛出的是少量精选票，而不是几百只大样本；
@@ -927,7 +939,7 @@ def main():
     stock_pool = load_score_stock_pool()
     stock_info = {row["ts_code"]: row["name"] for _, row in stock_pool.iterrows()}
     ts_codes = list(stock_info.keys())
-    print(f"股票池数量（ST/BJ过滤后，EPS过滤前）：{len(ts_codes)}")
+    print(f"股票池数量（ST/BJ过滤后，EPS/总市值过滤前）：{len(ts_codes)}")
 
     all_daily = sc.load_all_daily(ts_codes, trade_dates)
     if all_daily.empty:
@@ -941,7 +953,12 @@ def main():
             on=["ts_code", "trade_date"],
             how="left"
         )
-    for col in ["eps", "volume_ratio", "turnover_rate", "pe", "pe_ttm"]:
+    basic_columns = ["volume_ratio", "turnover_rate", "pe", "pe_ttm"]
+    if EPS_FILTER_ENABLED:
+        basic_columns.append("eps")
+    if TOTAL_MV_FILTER_ENABLED:
+        basic_columns.append("total_mv")
+    for col in basic_columns:
         if col not in all_daily.columns:
             all_daily[col] = pd.NA
 
@@ -979,7 +996,7 @@ def main():
 
     print(
         f"候选信号表：{candidate_signal_count} 行；"
-        f"EPS+ST/BJ过滤后股票数：{candidate_stock_count}；"
+        f"EPS+总市值+ST/BJ过滤后股票数：{candidate_stock_count}；"
         f"平均每天候选数：{avg_candidate_per_day:.2f}"
     )
 
@@ -997,15 +1014,17 @@ def main():
         {"key": "signal_date_end", "value": signal_dates[-1]},
         {"key": "forward_days", "value": str(FORWARD_DAYS)},
         {"key": "return_weight_mode", "value": "收益分权重已上调，排名更偏向真实收益兑现"},
-        {"key": "stock_count_after_st_bj_before_eps", "value": len(ts_codes)},
-        {"key": "stock_count_after_eps_st_bj", "value": candidate_stock_count},
-        {"key": "candidate_signal_count_after_eps_st_bj", "value": candidate_signal_count},
+        {"key": "stock_count_after_st_bj_before_eps_total_mv", "value": len(ts_codes)},
+        {"key": "stock_count_after_eps_total_mv_st_bj", "value": candidate_stock_count},
+        {"key": "candidate_signal_count_after_eps_total_mv_st_bj", "value": candidate_signal_count},
         {"key": "signal_day_count", "value": signal_day_count},
-        {"key": "avg_candidate_per_day_after_eps_st_bj", "value": round(avg_candidate_per_day, 2)},
+        {"key": "avg_candidate_per_day_after_eps_total_mv_st_bj", "value": round(avg_candidate_per_day, 2)},
         {"key": "target_selection_rate", "value": TARGET_SELECTION_RATE},
         {"key": "max_ok_selection_rate", "value": MAX_OK_SELECTION_RATE},
         {"key": "enable_eps_filter", "value": EPS_FILTER_ENABLED},
         {"key": "min_eps", "value": MIN_EPS},
+        {"key": "enable_total_mv_filter", "value": TOTAL_MV_FILTER_ENABLED},
+        {"key": "min_total_mv", "value": MIN_TOTAL_MV},
         {"key": "min_volume_ratio", "value": MIN_VOLUME_RATIO},
         {"key": "max_volume_ratio", "value": MAX_VOLUME_RATIO},
         {"key": "min_turnover_rate", "value": MIN_TURNOVER_RATE},
