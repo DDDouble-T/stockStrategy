@@ -52,7 +52,16 @@ CONDITION_FLAGS = RUNTIME_CONFIG["conditions"]
 RSI_MAX = RUNTIME_CONFIG["rsi_max"]
 NEAR_MA_THRESHOLD = RUNTIME_CONFIG["near_ma_threshold"]
 RECENT_HIGH_LOOKBACK_DAYS = RUNTIME_CONFIG["recent_high_lookback_days"]
-MIN_EPS = RUNTIME_CONFIG["min_eps"]
+def normalize_optional_number(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return float(value)
+
+
+MIN_EPS = normalize_optional_number(RUNTIME_CONFIG["min_eps"])
+EPS_FILTER_ENABLED = bool(RUNTIME_CONFIG.get("enable_eps_filter", True)) and MIN_EPS is not None
 MIN_VOLUME_RATIO = RUNTIME_CONFIG["min_volume_ratio"]
 MIN_EXTERNAL_INTERNAL_RATIO = RUNTIME_CONFIG["min_external_internal_ratio"]
 MIN_TURNOVER_RATE = RUNTIME_CONFIG["min_turnover_rate"]
@@ -415,7 +424,7 @@ def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
 
 def load_all_basic(ts_codes, trade_dates, daily_df=None):
     cache_df = load_basic_cache()
-    required_columns = {"ts_code", "trade_date", "eps", "volume_ratio", "turnover_rate", "pe"}
+    required_columns = {"ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"}
     cache_has_required_columns = required_columns.issubset(set(cache_df.columns))
     valid_cached_dates = set()
     invalid_cached_dates = []
@@ -434,9 +443,8 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
             if date_df.empty:
                 continue
 
-            # 仅按“日期存在”判断缓存命中是不够的。
-            # 历史上出现过某个交易日缓存里 eps 全空的情况，这会让整天样本被错误过滤。
-            eps_ready = date_df["eps"].notna().any()
+            # EPS 缺失时不参与过滤，因此不能因为 eps 全空就判定缓存不可用。
+            eps_ready = True
             daily_basic_ready = date_df[["volume_ratio", "turnover_rate", "pe"]].notna().any(axis=0).all()
             expected_count = expected_counts.get(trade_date)
             coverage_ready = True
@@ -464,12 +472,16 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         )
         if daily_basic_df.empty:
             raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-        bak_basic_df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_bak_basic_by_trade_date_with_limit(trade_date),
-            f"bak_basic {trade_date}"
-        )
-        if bak_basic_df.empty:
-            raise RuntimeError(f"bak_basic {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
+        bak_basic_df = None
+        if EPS_FILTER_ENABLED:
+            try:
+                bak_basic_df = fetch_bak_basic_by_trade_date_with_limit(trade_date)
+            except Exception as e:
+                print(f"bak_basic {trade_date} 拉取 EPS 失败，跳过该交易日基础面补齐：{e}")
+                continue
+            if bak_basic_df.empty:
+                print(f"bak_basic {trade_date} 返回空数据，跳过该交易日基础面补齐")
+                continue
 
         merged = merge_basic_frames(daily_basic_df, bak_basic_df, trade_date)
         if not merged.empty:
@@ -684,12 +696,10 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
     row = df.iloc[i]
     prev = df.iloc[i - 1]
 
-    if pd.isna(row["eps"]):
-        add_stat(stats, "基础面数据不足")
-        return False
-    if row["eps"] < MIN_EPS:
-        add_stat(stats, "每股盈利不达标")
-        return False
+    if EPS_FILTER_ENABLED:
+        if pd.notna(row["eps"]) and row["eps"] < MIN_EPS:
+            add_stat(stats, "每股盈利不达标")
+            return False
 
     if CONDITION_FLAGS["trend_above_ma20"] and pd.isna(row["ma20"]):
         add_stat(stats, "指标数据不足")
@@ -1109,7 +1119,8 @@ def save_display_excel(display_table, filename=RESULT_XLSX):
     summary_sheet["A2"] = "策略说明"
     summary_sheet["B2"] = RUNTIME_CONFIG.get("description", "")
     summary_sheet["A3"] = "基础过滤"
-    summary_sheet["B3"] = f"排除ST：{RUNTIME_CONFIG['exclude_st_stocks']}；EPS >= {MIN_EPS}"
+    eps_filter_text = f"EPS >= {MIN_EPS}" if EPS_FILTER_ENABLED else "EPS不过滤"
+    summary_sheet["B3"] = f"排除ST：{RUNTIME_CONFIG['exclude_st_stocks']}；{eps_filter_text}"
     summary_sheet["A4"] = "启用条件"
     summary_sheet["B4"] = "、".join(enabled_condition_names)
     summary_sheet["A6"] = "启用条件明细"

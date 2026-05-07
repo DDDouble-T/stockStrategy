@@ -76,6 +76,7 @@ EXCLUDE_BJ = True
 # EPS 和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
 # EPS 如果 daily_basic 没直接给，会用 close / pe_ttm 或 close / pe 粗略反推。
 MIN_EPS = getattr(sc, "MIN_EPS", 0.0)
+EPS_FILTER_ENABLED = getattr(sc, "EPS_FILTER_ENABLED", MIN_EPS is not None)
 
 # 量比：过低代表不活跃，过高可能是高潮或异常。先用宽松区间。
 MIN_VOLUME_RATIO = getattr(sc, "MIN_VOLUME_RATIO", 0.8)
@@ -360,11 +361,12 @@ def build_condition_base_df(
             for col in ["eps", "volume_ratio", "turnover_rate", "pe", "pe_ttm"]:
                 ensure_numeric_column(df, col)
 
-            # 如果 eps 缺失，则用 close / pe_ttm 或 close / pe 反推一个近似 EPS。
-            # 这不是严格财报 EPS，但作为“排除亏损/极差样本”的基础过滤足够实用。
-            pe_ref = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
-            eps_estimated = df["close"] / pe_ref.where(pe_ref > 0)
-            df["eps"] = df["eps"].where(df["eps"].notna(), eps_estimated)
+            if EPS_FILTER_ENABLED:
+                # 如果 eps 缺失，则用 close / pe_ttm 或 close / pe 反推一个近似 EPS。
+                # 这不是严格财报 EPS，但作为“排除亏损/极差样本”的基础过滤足够实用。
+                pe_ref = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+                eps_estimated = df["close"] / pe_ref.where(pe_ref > 0)
+                df["eps"] = df["eps"].where(df["eps"].notna(), eps_estimated)
 
             # 基础派生列
             df["price_up"] = df["close"] > df["close"].shift(1)
@@ -384,7 +386,9 @@ def build_condition_base_df(
             df["macd_golden_cross"] = df["macd_gold"].fillna(False)
             df["rsi_not_overheated"] = df["rsi"] < sc.RSI_MAX
 
-            df["eps_basic_filter"] = df["eps"] >= MIN_EPS
+            df["eps_basic_filter"] = True
+            if EPS_FILTER_ENABLED:
+                df["eps_basic_filter"] = df["eps"].isna() | (df["eps"] >= MIN_EPS)
             df["volume_ratio_high"] = (
                 (df["volume_ratio"] >= MIN_VOLUME_RATIO)
                 & (df["volume_ratio"] <= MAX_VOLUME_RATIO)
@@ -429,8 +433,8 @@ def build_condition_base_df(
                 if pd.isna(base_close) or base_close <= 0:
                     continue
 
-                # EPS 基础过滤：这里过滤后，base_df 就是“EPS + ST/BJ 过滤后的候选池”。
-                if not bool(row["eps_basic_filter"]):
+                # EPS 基础过滤关闭时，缺失 EPS 不会影响候选池。
+                if EPS_FILTER_ENABLED and not bool(row["eps_basic_filter"]):
                     continue
 
                 item = {
@@ -1000,6 +1004,7 @@ def main():
         {"key": "avg_candidate_per_day_after_eps_st_bj", "value": round(avg_candidate_per_day, 2)},
         {"key": "target_selection_rate", "value": TARGET_SELECTION_RATE},
         {"key": "max_ok_selection_rate", "value": MAX_OK_SELECTION_RATE},
+        {"key": "enable_eps_filter", "value": EPS_FILTER_ENABLED},
         {"key": "min_eps", "value": MIN_EPS},
         {"key": "min_volume_ratio", "value": MIN_VOLUME_RATIO},
         {"key": "max_volume_ratio", "value": MAX_VOLUME_RATIO},

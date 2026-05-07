@@ -20,7 +20,9 @@ DEFAULT_CONFIG = {
     "recent_high_lookback_days": 20,
     # 上一年度每 10 股税前现金分红下限，单位与 TuShare dividend.cash_div_tax 保持一致。
     "prev_year_min_cash_div_tax": 1.0,
-    # 每股收益 EPS 基础过滤下限。
+    # 是否启用每股收益 EPS 基础过滤；关闭后不拉取 EPS，也不按 EPS 过滤。
+    "enable_eps_filter": True,
+    # 每股收益 EPS 基础过滤下限；仅在 enable_eps_filter 为 True 且 eps 有值时生效。
     "min_eps": 0.2,
     # 量比下限。
     "min_volume_ratio": 1.0,
