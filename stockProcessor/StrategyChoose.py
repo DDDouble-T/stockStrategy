@@ -496,12 +496,12 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         if EPS_FILTER_ENABLED:
             try:
                 bak_basic_df = fetch_bak_basic_by_trade_date_with_limit(trade_date)
+                if bak_basic_df.empty:
+                    print(f"bak_basic {trade_date} 返回空数据，跳过 EPS 下载，继续使用 daily_basic 补齐基础面")
+                    bak_basic_df = None
             except Exception as e:
-                print(f"bak_basic {trade_date} 拉取 EPS 失败，跳过该交易日基础面补齐：{e}")
-                continue
-            if bak_basic_df.empty:
-                print(f"bak_basic {trade_date} 返回空数据，跳过该交易日基础面补齐")
-                continue
+                print(f"bak_basic {trade_date} 拉取 EPS 失败，跳过 EPS 下载，继续使用 daily_basic 补齐基础面：{e}")
+                bak_basic_df = None
 
         merged = merge_basic_frames(daily_basic_df, bak_basic_df, trade_date)
         if not merged.empty:
