@@ -737,6 +737,25 @@ def add_stat(stats, key):
         stats[key] = stats.get(key, 0) + 1
 
 
+def print_basic_filter_stock_counts(all_daily, signal_dates, stock_pool_count):
+    signal_df = all_daily[all_daily["trade_date"].isin(set(signal_dates))].copy()
+    if signal_df.empty:
+        print(f"基础过滤前股票数（排除ST后）：{stock_pool_count}；基础过滤后股票数：0")
+        return
+
+    eligible_mask = pd.Series(True, index=signal_df.index)
+    if EPS_FILTER_ENABLED:
+        eligible_mask &= signal_df["eps"].isna() | (signal_df["eps"] >= MIN_EPS)
+    if TOTAL_MV_FILTER_ENABLED:
+        eligible_mask &= signal_df["total_mv"].isna() | (signal_df["total_mv"] > MIN_TOTAL_MV)
+
+    filtered_stock_count = signal_df.loc[eligible_mask, "ts_code"].nunique()
+    print(
+        f"基础过滤前股票数（排除ST后）：{stock_pool_count}；"
+        f"基础过滤后股票数（信号窗口内至少1天通过EPS/总市值）：{filtered_stock_count}"
+    )
+
+
 def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref, shareholder_cache_ref, stats=None):
     row = df.iloc[i]
     prev = df.iloc[i - 1]
@@ -951,6 +970,7 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
             all_daily[col] = pd.NA
     if TOTAL_MV_FILTER_ENABLED and "total_mv" not in all_daily.columns:
         all_daily["total_mv"] = pd.NA
+    print_basic_filter_stock_counts(all_daily, signal_dates, len(ts_codes))
     moneyflow_needed = (
         CONDITION_FLAGS["external_internal_ratio_high"]
         or CONDITION_FLAGS["main_money_inflow_2days"]

@@ -313,6 +313,57 @@ def ensure_numeric_column(df: pd.DataFrame, col: str):
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
 
+def print_basic_filter_stock_counts(all_daily: pd.DataFrame, signal_dates: list, stock_pool_count: int):
+    if all_daily.empty:
+        print(f"基础过滤前股票数（ST/BJ过滤后）：{stock_pool_count}")
+        print("EPS过滤后股票数：0")
+        print("总市值过滤后股票数：0")
+        return
+
+    signal_date_set = set(signal_dates)
+    eps_stock_codes = set()
+    total_mv_stock_codes = set()
+
+    for ts_code, raw_df in all_daily.groupby("ts_code"):
+        df = raw_df.sort_values("trade_date").reset_index(drop=True).copy()
+
+        basic_columns = ["pe", "pe_ttm", "total_mv"]
+        if EPS_FILTER_ENABLED:
+            basic_columns.append("eps")
+        for col in basic_columns:
+            ensure_numeric_column(df, col)
+
+        if EPS_FILTER_ENABLED:
+            pe_ref = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+            eps_estimated = df["close"] / pe_ref.where(pe_ref > 0)
+            df["eps"] = df["eps"].where(df["eps"].notna(), eps_estimated)
+
+        signal_df = df[df["trade_date"].astype(str).isin(signal_date_set)].copy()
+        if signal_df.empty:
+            continue
+
+        signal_df = signal_df[pd.notna(signal_df["close"]) & (signal_df["close"] > 0)]
+        if signal_df.empty:
+            continue
+
+        eps_mask = pd.Series(True, index=signal_df.index)
+        if EPS_FILTER_ENABLED:
+            eps_mask &= signal_df["eps"].isna() | (signal_df["eps"] >= MIN_EPS)
+
+        total_mv_mask = pd.Series(True, index=signal_df.index)
+        if TOTAL_MV_FILTER_ENABLED:
+            total_mv_mask &= signal_df["total_mv"].isna() | (signal_df["total_mv"] > MIN_TOTAL_MV)
+
+        if bool(eps_mask.any()):
+            eps_stock_codes.add(ts_code)
+        if bool(total_mv_mask.any()):
+            total_mv_stock_codes.add(ts_code)
+
+    print(f"基础过滤前股票数（ST/BJ过滤后）：{stock_pool_count}")
+    print(f"EPS过滤后股票数（信号窗口内至少1天通过EPS）：{len(eps_stock_codes)}")
+    print(f"总市值过滤后股票数（最近交易日总市值通过）：{len(total_mv_stock_codes)}")
+
+
 def build_condition_base_df(
     all_daily: pd.DataFrame,
     stock_info: dict,
@@ -965,6 +1016,7 @@ def main():
     for col in basic_columns:
         if col not in all_daily.columns:
             all_daily[col] = pd.NA
+    print_basic_filter_stock_counts(all_daily, signal_dates, len(ts_codes))
 
     # 只要条件组合里包含资金流/内外盘相关条件，就需要资金流预计算。
     moneyflow_df = pd.DataFrame()

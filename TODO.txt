@@ -1,0 +1,6 @@
+eps逻辑不一致：
+choose 和 score 现在不一致
+choose：eps 为空就放过
+score：先用 close / pe_ttm 或 close / pe 反推，反推出值后就按反推值过滤，只有反推失败才放过
+
+增加估值低策略
