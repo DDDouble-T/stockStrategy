@@ -19,6 +19,10 @@ import strategy_choose_config
 # - update：按当前区间全部重下 EPS
 RUN_MODE = "download"
 END_DATE = None
+# 仅在 RUN_MODE = "update" 时生效。
+# None / ""：从基础面缓存中的最早 trade_date 开始更新。
+# 例如 "20250101"：从指定日期开始更新到 END_DATE 或最近已完成交易日。
+UPDATE_START_DATE = None
 
 
 def load_strategy_runtime_config():
@@ -40,7 +44,6 @@ def load_strategy_runtime_config():
 
 
 RUNTIME_CONFIG = load_strategy_runtime_config()
-TRADE_DAYS = int(RUNTIME_CONFIG["data_lookback_trade_days"])
 MARKET_CLOSE_HOUR = int(RUNTIME_CONFIG.get("market_close_hour", 15))
 BAK_BASIC_MIN_INTERVAL_SECONDS = int(RUNTIME_CONFIG.get("bak_basic_min_interval_seconds", 30))
 
@@ -81,12 +84,11 @@ def get_latest_completed_trade_date(now=None):
     return trade_dates[-2]
 
 
-def get_trade_dates(end_date, count):
+def get_trade_dates(start_date, end_date):
     pro = pro_api()
-    calendar_lookback_days = max(180, count * 2 + 30)
     cal = pro.trade_cal(
         exchange="SSE",
-        start_date=(datetime.strptime(end_date, "%Y%m%d") - timedelta(days=calendar_lookback_days)).strftime("%Y%m%d"),
+        start_date=start_date,
         end_date=end_date,
         is_open="1"
     )
@@ -94,7 +96,7 @@ def get_trade_dates(end_date, count):
     trade_dates = cal["cal_date"].tolist()
     if not trade_dates:
         raise ValueError("未获取到可用交易日，请检查交易日历接口")
-    return trade_dates[-count:]
+    return trade_dates
 
 
 def normalize_basic_cache_df(df):
@@ -195,6 +197,21 @@ def get_expected_counts_from_basic_cache():
     return cache_df.groupby("trade_date")["ts_code"].nunique().to_dict()
 
 
+def get_cached_trade_dates():
+    cache_df = load_basic_cache_file()
+    if cache_df.empty or "trade_date" not in cache_df.columns:
+        return []
+    trade_dates = (
+        cache_df["trade_date"]
+        .dropna()
+        .astype(str)
+        .sort_values()
+        .unique()
+        .tolist()
+    )
+    return trade_dates
+
+
 def fetch_bak_basic_by_trade_date(trade_date):
     pro = pro_api()
     return pro.bak_basic(trade_date=trade_date)
@@ -283,8 +300,7 @@ def download_eps(trade_dates):
 
 def update_eps(trade_dates):
     trade_dates = [str(trade_date) for trade_date in trade_dates]
-    print(f"开始全量更新 EPS 数据，共 {len(trade_dates)} 个交易日")
-    upsert_eps_cache_rows(pd.DataFrame(columns=["ts_code", "trade_date", "eps"]), clear_trade_dates=trade_dates)
+    print(f"开始顺序更新 EPS 数据，共 {len(trade_dates)} 个交易日")
 
     for trade_date in trade_dates:
         eps_df = fetch_eps_by_trade_date(trade_date)
@@ -300,23 +316,34 @@ def update_eps(trade_dates):
 def validate_runtime_config():
     if RUN_MODE not in {"download", "update"}:
         raise ValueError(f"RUN_MODE 配置错误: {RUN_MODE}")
-    if TRADE_DAYS <= 0:
-        raise ValueError("TRADE_DAYS 必须大于 0")
 
 
 def main():
     validate_runtime_config()
-    end_date = END_DATE or get_latest_completed_trade_date()
-    trade_dates = get_trade_dates(end_date, TRADE_DAYS)
-    print(
-        f"EPS 处理模式：{RUN_MODE}；"
-        f"区间：{trade_dates[0]} ~ {trade_dates[-1]}；"
-        f"共 {len(trade_dates)} 个交易日"
-    )
+    cached_trade_dates = get_cached_trade_dates()
+    if not cached_trade_dates:
+        raise ValueError("strategy_basic_cache.csv 中没有可用 trade_date，无法补齐或更新 EPS，请先准备基础面缓存")
 
     if RUN_MODE == "download":
+        trade_dates = cached_trade_dates
+        print(
+            f"EPS 处理模式：{RUN_MODE}；"
+            f"按基础面缓存遍历：{trade_dates[0]} ~ {trade_dates[-1]}；"
+            f"共 {len(trade_dates)} 个交易日"
+        )
         download_eps(trade_dates)
     else:
+        end_date = END_DATE or get_latest_completed_trade_date()
+        start_date = str(UPDATE_START_DATE).strip() if UPDATE_START_DATE is not None else ""
+        if not start_date:
+            start_date = cached_trade_dates[0]
+        trade_dates = get_trade_dates(start_date, end_date)
+        print(
+            f"EPS 处理模式：{RUN_MODE}；"
+            f"更新起点：{start_date}；"
+            f"区间：{trade_dates[0]} ~ {trade_dates[-1]}；"
+            f"共 {len(trade_dates)} 个交易日"
+        )
         update_eps(trade_dates)
 
 
