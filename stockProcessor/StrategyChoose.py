@@ -1,7 +1,6 @@
 import pandas as pd
 import tushare as ts
 import os
-import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from openpyxl import Workbook
@@ -9,6 +8,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from module.basic import basic_api
 from module.config import tushare_config
+from stockProcessor import eps_download as eps_downloader
 from stockProcessor.download.constants import data_path, score_result_path
 import strategy_choose_config
 
@@ -35,7 +35,7 @@ def load_strategy_runtime_config():
 
 RUNTIME_CONFIG = load_strategy_runtime_config()
 END_DATE = None  # None 表示自动取最近一个已结束的交易日
-MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_HOUR = int(RUNTIME_CONFIG.get("market_close_hour", 15))
 DATA_LOOKBACK_TRADE_DAYS = RUNTIME_CONFIG["data_lookback_trade_days"]
 SIGNAL_DAYS = RUNTIME_CONFIG["signal_days"]
 MAX_FORWARD_DAYS = RUNTIME_CONFIG["max_forward_days"]
@@ -69,8 +69,6 @@ MIN_EXTERNAL_INTERNAL_RATIO = RUNTIME_CONFIG["min_external_internal_ratio"]
 MIN_TURNOVER_RATE = RUNTIME_CONFIG["min_turnover_rate"]
 MAX_TURNOVER_RATE = RUNTIME_CONFIG["max_turnover_rate"]
 MAX_PE = RUNTIME_CONFIG["max_pe"]
-BAK_BASIC_MIN_INTERVAL_SECONDS = 30
-LAST_BAK_BASIC_FETCH_TS = None
 
 CONDITION_NAMES = {
     "trend_above_ma20": "股价在20日线之上",
@@ -402,17 +400,14 @@ def load_all_moneyflow(trade_dates):
 
 
 def load_basic_cache():
-    if not os.path.exists(BASIC_CACHE_CSV):
-        return pd.DataFrame()
+    df = eps_downloader.load_basic_cache_file()
+    if df.empty:
+        return df
 
-    df = pd.read_csv(BASIC_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
-    if "trade_date" in df.columns:
-        df["trade_date"] = df["trade_date"].astype(str)
-    if "total_mv" in df.columns:
-        df = df.drop(columns=["total_mv"])
+    drop_columns = [col for col in ["total_mv", "eps"] if col in df.columns]
+    if drop_columns:
+        df = df.drop(columns=drop_columns)
     numeric_columns = ["volume_ratio", "turnover_rate", "pe"]
-    if EPS_FILTER_ENABLED:
-        numeric_columns.append("eps")
     for col in numeric_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -420,12 +415,8 @@ def load_basic_cache():
 
 
 def save_basic_cache(df):
-    os.makedirs(os.path.dirname(BASIC_CACHE_CSV), exist_ok=True)
-    if "total_mv" in df.columns:
-        df = df.drop(columns=["total_mv"])
-    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
-    df.to_csv(BASIC_CACHE_CSV, index=False, encoding="utf-8-sig")
+    df = df.drop(columns=["total_mv"], errors="ignore")
+    eps_downloader.upsert_basic_cache_rows(df)
 
 
 def fetch_daily_basic_by_trade_date(trade_date):
@@ -469,61 +460,22 @@ def load_latest_total_mv(ts_codes, trade_date):
     return total_mv_df[["ts_code", "total_mv"]]
 
 
-def fetch_bak_basic_by_trade_date(trade_date):
-    pro = pro_api()
-    return pro.bak_basic(trade_date=trade_date)
-
-
-def fetch_bak_basic_by_trade_date_with_limit(trade_date):
-    global LAST_BAK_BASIC_FETCH_TS
-
-    if LAST_BAK_BASIC_FETCH_TS is not None:
-        elapsed = time.time() - LAST_BAK_BASIC_FETCH_TS
-        wait_seconds = BAK_BASIC_MIN_INTERVAL_SECONDS - elapsed
-        if wait_seconds > 0:
-            print(f"bak_basic 限频等待 {wait_seconds:.1f} 秒：{trade_date}")
-            time.sleep(wait_seconds)
-
-    df = fetch_bak_basic_by_trade_date(trade_date)
-    LAST_BAK_BASIC_FETCH_TS = time.time()
-    return df
-
-
-def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
+def merge_basic_frames(daily_basic_df, trade_date):
     daily_basic_columns = ["ts_code", "trade_date", "pe", "pe_ttm", "volume_ratio", "turnover_rate"]
     if daily_basic_df is None or daily_basic_df.empty:
         daily_basic_df = pd.DataFrame(columns=daily_basic_columns)
-    if bak_basic_df is None or bak_basic_df.empty:
-        bak_basic_df = pd.DataFrame(columns=["ts_code", "trade_date"])
 
     daily_basic_df = daily_basic_df.copy()
-    bak_basic_df = bak_basic_df.copy()
 
     if "trade_date" not in daily_basic_df.columns:
         daily_basic_df["trade_date"] = trade_date
-    if "trade_date" not in bak_basic_df.columns:
-        bak_basic_df["trade_date"] = trade_date
 
-    merged = pd.merge(
-        daily_basic_df,
-        bak_basic_df,
-        on=["ts_code", "trade_date"],
-        how="outer",
-        suffixes=("", "_bak")
-    )
+    merged = daily_basic_df.copy()
 
     if "pe_ttm" in merged.columns:
         merged["pe"] = merged["pe_ttm"].where(merged["pe_ttm"].notna(), merged.get("pe"))
 
-    if EPS_FILTER_ENABLED and "eps" not in merged.columns:
-        merged["eps"] = pd.NA
-
-    if "close" in merged.columns:
-        pass
-
     columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
-    if EPS_FILTER_ENABLED:
-        columns.insert(2, "eps")
     for col in columns:
         if col not in merged.columns:
             merged[col] = pd.NA
@@ -580,18 +532,7 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         )
         if daily_basic_df.empty:
             raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-        bak_basic_df = None
-        if EPS_FILTER_ENABLED:
-            try:
-                bak_basic_df = fetch_bak_basic_by_trade_date_with_limit(trade_date)
-                if bak_basic_df.empty:
-                    print(f"bak_basic {trade_date} 返回空数据，跳过 EPS 下载，继续使用 daily_basic 补齐基础面")
-                    bak_basic_df = None
-            except Exception as e:
-                print(f"bak_basic {trade_date} 拉取 EPS 失败，跳过 EPS 下载，继续使用 daily_basic 补齐基础面：{e}")
-                bak_basic_df = None
-
-        merged = merge_basic_frames(daily_basic_df, bak_basic_df, trade_date)
+        merged = merge_basic_frames(daily_basic_df, trade_date)
         if not merged.empty:
             cache_df = pd.concat([cache_df, merged], ignore_index=True)
             save_basic_cache(cache_df)
@@ -610,9 +551,20 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         & cache_df["trade_date"].isin(trade_date_set)
     ].copy()
     result_columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
-    if EPS_FILTER_ENABLED:
-        result_columns.insert(2, "eps")
     result = result[[col for col in result_columns if col in result.columns]].copy()
+    if EPS_FILTER_ENABLED:
+        # EPS 改为独立下载；主流程只读取 basic 缓存文件里已准备好的结果，不再顺手触发 bak_basic 下载。
+        eps_cache_df = eps_downloader.load_eps_cache()
+        if not eps_cache_df.empty:
+            eps_result = eps_cache_df[
+                eps_cache_df["ts_code"].isin(ts_code_set)
+                & eps_cache_df["trade_date"].isin(trade_date_set)
+            ][["ts_code", "trade_date", "eps"]].copy()
+            result = result.merge(eps_result, on=["ts_code", "trade_date"], how="left")
+        else:
+            result["eps"] = pd.NA
+        result_columns.insert(2, "eps")
+        result = result[[col for col in result_columns if col in result.columns]].copy()
     print(
         f"本次使用基础面缓存：{len(result)} 行，"
         f"{result['trade_date'].nunique() if not result.empty else 0} 个交易日，"

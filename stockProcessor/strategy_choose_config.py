@@ -4,6 +4,10 @@ ACTIVE_STRATEGY = "sharechoose"
 DEFAULT_CONFIG = {
     # 拉取最近多少个交易日的日线数据；需覆盖指标计算、信号筛选和后续表现回看窗口。
     "data_lookback_trade_days": 120,
+    # 交易日收盘小时；当前时间早于该小时且当天是交易日时，默认回退到上一交易日。
+    "market_close_hour": 15,
+    # bak_basic 接口限频等待秒数。
+    "bak_basic_min_interval_seconds": 30,
     # 在最近多少个交易日内逐日筛选信号；不能大于 data_lookback_trade_days。
     "signal_days": 30,
     # 信号出现后最多向后统计多少个交易日表现；None 表示统计到已拉取数据末尾。
