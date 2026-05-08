@@ -733,10 +733,7 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
             return False
 
     if TOTAL_MV_FILTER_ENABLED:
-        if pd.isna(row["total_mv"]):
-            add_stat(stats, "基础面数据不足")
-            return False
-        if row["total_mv"] <= MIN_TOTAL_MV:
+        if pd.notna(row["total_mv"]) and row["total_mv"] <= MIN_TOTAL_MV:
             add_stat(stats, "总市值不达标")
             return False
 
@@ -1104,7 +1101,8 @@ def build_display_table(detail_df):
 
     signal_dates = set(base_df["signal_date"])
     dates = sorted(set(detail_df["signal_date"]).union(set(detail_df["future_date"])))
-    columns = []
+    fixed_columns = ["股票代码", "股票名称", "信号日期"]
+    columns = fixed_columns.copy()
     for date in dates:
         columns.append(date)
         if date in signal_dates:
@@ -1121,11 +1119,14 @@ def build_display_table(detail_df):
         for _ in range(3):
             rows.append(init_display_row(columns))
 
+        for offset in range(3):
+            rows[start_row + offset]["股票代码"] = row["ts_code"]
+            rows[start_row + offset]["股票名称"] = row["name"]
+            rows[start_row + offset]["信号日期"] = row["signal_date"]
+
         date_col = row["signal_date"]
         price_col = f"{row['signal_date']}_价格"
 
-        rows[start_row][date_col] = row["ts_code"]
-        rows[start_row + 1][date_col] = row["name"]
         rows[start_row][price_col] = f"收盘价{format_price(row['base_close'])}"
         rows[start_row + 1][price_col] = f"最高价{format_price(row['base_high'])}"
         rows[start_row + 2][price_col] = f"最低价{format_price(row['base_low'])}"
@@ -1203,7 +1204,11 @@ def save_display_excel(display_table, filename=RESULT_XLSX):
             elif isinstance(value, str) and value.startswith("-"):
                 cell.font = green_font
 
-    for col_index in range(1, column_count + 1):
+    worksheet.freeze_panes = "D2"
+    worksheet.column_dimensions["A"].width = 14
+    worksheet.column_dimensions["B"].width = 16
+    worksheet.column_dimensions["C"].width = 12
+    for col_index in range(4, column_count + 1):
         worksheet.column_dimensions[get_column_letter(col_index)].width = 18
 
     workbook.save(filename)

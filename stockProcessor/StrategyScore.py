@@ -443,7 +443,7 @@ def build_condition_base_df(
                 # EPS 基础过滤关闭时，缺失 EPS 不会影响候选池。
                 if EPS_FILTER_ENABLED and not bool(row["eps_basic_filter"]):
                     continue
-                if TOTAL_MV_FILTER_ENABLED and (pd.isna(row["total_mv"]) or row["total_mv"] <= MIN_TOTAL_MV):
+                if TOTAL_MV_FILTER_ENABLED and pd.notna(row["total_mv"]) and row["total_mv"] <= MIN_TOTAL_MV:
                     continue
 
                 item = {
