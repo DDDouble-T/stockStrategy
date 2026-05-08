@@ -945,6 +945,10 @@ def main():
     if all_daily.empty:
         print("没有获取到日线数据")
         return
+    if TOTAL_MV_FILTER_ENABLED:
+        # 评分阶段与筛选阶段保持一致：总市值统一使用最近一个交易日口径。
+        latest_total_mv_df = sc.load_latest_total_mv(ts_codes, trade_dates[-1])
+        all_daily = all_daily.merge(latest_total_mv_df, on=["ts_code"], how="left")
 
     all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
     if not all_basic.empty:

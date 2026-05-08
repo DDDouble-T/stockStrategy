@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     "min_eps": 0.2,
     # 是否启用总市值基础过滤；关闭后不按 total_mv 过滤。
     "enable_total_mv_filter": True,
-    # 总市值基础过滤下限；开启过滤后，仅在 total_mv 有值时按该阈值过滤。
+    # 总市值基础过滤下限；开启过滤后，按最近一个交易日拉取的 total_mv 过滤。
     # TuShare daily_basic.total_mv 单位为万元；500000 万元 = 50 亿元。
     "min_total_mv": 500000.0,
     # 量比下限。

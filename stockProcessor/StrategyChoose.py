@@ -238,21 +238,85 @@ def add_daily_indicators(df):
     return df
 
 
-def load_daily_cache():
-    if not os.path.exists(DAILY_CACHE_CSV):
+def normalize_daily_cache_df(df):
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    df = pd.read_csv(DAILY_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
+    df = df.copy()
     if "trade_date" in df.columns:
         df["trade_date"] = df["trade_date"].astype(str)
     return df
 
 
+def get_daily_cache_file_path(trade_date):
+    file_name = f"{str(trade_date)}_{os.path.basename(DAILY_CACHE_CSV)}"
+    return os.path.join(os.path.dirname(DAILY_CACHE_CSV), file_name)
+
+
+def read_daily_cache_file(cache_file):
+    if not os.path.exists(cache_file):
+        return pd.DataFrame()
+
+    df = pd.read_csv(cache_file, dtype={"ts_code": str, "trade_date": str})
+    return normalize_daily_cache_df(df)
+
+
+def load_legacy_daily_cache():
+    if not os.path.exists(DAILY_CACHE_CSV):
+        return pd.DataFrame()
+
+    df = pd.read_csv(DAILY_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
+    return normalize_daily_cache_df(df)
+
+
+def load_daily_cache(trade_dates):
+    cached_frames = []
+    cached_dates = set()
+    legacy_cache_df = None
+
+    for trade_date in trade_dates:
+        cache_file = get_daily_cache_file_path(trade_date)
+        date_df = read_daily_cache_file(cache_file)
+
+        if date_df.empty and os.path.exists(DAILY_CACHE_CSV):
+            if legacy_cache_df is None:
+                legacy_cache_df = load_legacy_daily_cache()
+            if not legacy_cache_df.empty and "trade_date" in legacy_cache_df.columns:
+                date_df = legacy_cache_df[legacy_cache_df["trade_date"] == str(trade_date)].copy()
+                if not date_df.empty:
+                    # 首次切换时兼容旧总文件缓存，迁移后后续命中直接按单日文件读取。
+                    save_daily_cache(date_df)
+                    print(f"已迁移日线缓存到单日文件：{trade_date}")
+
+        if date_df.empty:
+            continue
+
+        cached_frames.append(date_df)
+        cached_dates.add(str(trade_date))
+
+    if not cached_frames:
+        return pd.DataFrame(), cached_dates
+
+    cache_df = pd.concat(cached_frames, ignore_index=True)
+    cache_df = cache_df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+    cache_df = cache_df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
+    return cache_df, cached_dates
+
+
 def save_daily_cache(df):
+    if df is None or df.empty:
+        return
+
+    if "trade_date" not in df.columns:
+        raise ValueError("daily 缓存缺少 trade_date，无法按交易日拆分保存")
+
     os.makedirs(os.path.dirname(DAILY_CACHE_CSV), exist_ok=True)
+    df = normalize_daily_cache_df(df)
     df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
-    df.to_csv(DAILY_CACHE_CSV, index=False, encoding="utf-8-sig")
+    for trade_date, date_df in df.groupby("trade_date"):
+        cache_file = get_daily_cache_file_path(trade_date)
+        date_df = date_df.sort_values(by=["ts_code"]).reset_index(drop=True)
+        date_df.to_csv(cache_file, index=False, encoding="utf-8-sig")
 
 
 def fetch_daily_by_trade_date(trade_date):
@@ -344,11 +408,11 @@ def load_basic_cache():
     df = pd.read_csv(BASIC_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
     if "trade_date" in df.columns:
         df["trade_date"] = df["trade_date"].astype(str)
+    if "total_mv" in df.columns:
+        df = df.drop(columns=["total_mv"])
     numeric_columns = ["volume_ratio", "turnover_rate", "pe"]
     if EPS_FILTER_ENABLED:
         numeric_columns.append("eps")
-    if TOTAL_MV_FILTER_ENABLED:
-        numeric_columns.append("total_mv")
     for col in numeric_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -357,6 +421,8 @@ def load_basic_cache():
 
 def save_basic_cache(df):
     os.makedirs(os.path.dirname(BASIC_CACHE_CSV), exist_ok=True)
+    if "total_mv" in df.columns:
+        df = df.drop(columns=["total_mv"])
     df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
     df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
     df.to_csv(BASIC_CACHE_CSV, index=False, encoding="utf-8-sig")
@@ -365,12 +431,42 @@ def save_basic_cache(df):
 def fetch_daily_basic_by_trade_date(trade_date):
     pro = pro_api()
     fields = "ts_code,trade_date,pe,pe_ttm,volume_ratio,turnover_rate"
-    if TOTAL_MV_FILTER_ENABLED:
-        fields = "ts_code,trade_date,pe,pe_ttm,total_mv,volume_ratio,turnover_rate"
     return pro.daily_basic(
         trade_date=trade_date,
         fields=fields
     )
+
+
+def fetch_total_mv_by_trade_date(trade_date):
+    pro = pro_api()
+    return pro.daily_basic(
+        trade_date=trade_date,
+        fields="ts_code,trade_date,total_mv"
+    )
+
+
+def load_latest_total_mv(ts_codes, trade_date):
+    if not TOTAL_MV_FILTER_ENABLED:
+        return pd.DataFrame(columns=["ts_code", "total_mv"])
+
+    total_mv_df = fetch_with_retry(
+        lambda: fetch_total_mv_by_trade_date(trade_date),
+        f"daily_basic total_mv {trade_date}"
+    )
+    if total_mv_df.empty:
+        raise RuntimeError(f"daily_basic total_mv {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
+
+    total_mv_df = total_mv_df.copy()
+    total_mv_df["ts_code"] = total_mv_df["ts_code"].astype(str)
+    total_mv_df["total_mv"] = pd.to_numeric(total_mv_df["total_mv"], errors="coerce")
+    ts_code_set = set(ts_codes)
+    total_mv_df = total_mv_df[total_mv_df["ts_code"].isin(ts_code_set)].copy()
+    total_mv_df = total_mv_df.drop_duplicates(subset=["ts_code"], keep="last")
+    print(
+        f"已拉取最近交易日总市值：{trade_date}，"
+        f"{len(total_mv_df)} 只股票"
+    )
+    return total_mv_df[["ts_code", "total_mv"]]
 
 
 def fetch_bak_basic_by_trade_date(trade_date):
@@ -395,8 +491,6 @@ def fetch_bak_basic_by_trade_date_with_limit(trade_date):
 
 def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
     daily_basic_columns = ["ts_code", "trade_date", "pe", "pe_ttm", "volume_ratio", "turnover_rate"]
-    if TOTAL_MV_FILTER_ENABLED:
-        daily_basic_columns.append("total_mv")
     if daily_basic_df is None or daily_basic_df.empty:
         daily_basic_df = pd.DataFrame(columns=daily_basic_columns)
     if bak_basic_df is None or bak_basic_df.empty:
@@ -430,8 +524,6 @@ def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
     columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
     if EPS_FILTER_ENABLED:
         columns.insert(2, "eps")
-    if TOTAL_MV_FILTER_ENABLED:
-        columns.insert(3, "total_mv")
     for col in columns:
         if col not in merged.columns:
             merged[col] = pd.NA
@@ -442,8 +534,6 @@ def merge_basic_frames(daily_basic_df, bak_basic_df, trade_date):
 def load_all_basic(ts_codes, trade_dates, daily_df=None):
     cache_df = load_basic_cache()
     required_columns = {"ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"}
-    if TOTAL_MV_FILTER_ENABLED:
-        required_columns.add("total_mv")
     cache_has_required_columns = required_columns.issubset(set(cache_df.columns))
     valid_cached_dates = set()
     invalid_cached_dates = []
@@ -463,8 +553,6 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
                 continue
 
             daily_basic_columns = ["volume_ratio", "turnover_rate", "pe"]
-            if TOTAL_MV_FILTER_ENABLED:
-                daily_basic_columns.append("total_mv")
             daily_basic_ready = date_df[daily_basic_columns].notna().any(axis=0).all()
             expected_count = expected_counts.get(trade_date)
             coverage_ready = True
@@ -513,8 +601,6 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
         columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
         if EPS_FILTER_ENABLED:
             columns.insert(2, "eps")
-        if TOTAL_MV_FILTER_ENABLED:
-            columns.insert(3, "total_mv")
         return pd.DataFrame(columns=columns)
 
     ts_code_set = set(ts_codes)
@@ -526,8 +612,6 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
     result_columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
     if EPS_FILTER_ENABLED:
         result_columns.insert(2, "eps")
-    if TOTAL_MV_FILTER_ENABLED:
-        result_columns.insert(3, "total_mv")
     result = result[[col for col in result_columns if col in result.columns]].copy()
     print(
         f"本次使用基础面缓存：{len(result)} 行，"
@@ -678,10 +762,7 @@ def is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref):
 
 
 def load_all_daily(ts_codes, trade_dates):
-    cache_df = load_daily_cache()
-    cached_dates = set()
-    if not cache_df.empty and "trade_date" in cache_df.columns:
-        cached_dates = set(cache_df["trade_date"].astype(str))
+    cache_df, cached_dates = load_daily_cache(trade_dates)
 
     missing_dates = [trade_date for trade_date in trade_dates if trade_date not in cached_dates]
     if missing_dates:
@@ -697,8 +778,8 @@ def load_all_daily(ts_codes, trade_dates):
         if df.empty:
             raise RuntimeError(f"daily {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
         df["trade_date"] = df["trade_date"].astype(str)
+        save_daily_cache(df)
         cache_df = pd.concat([cache_df, df], ignore_index=True)
-        save_daily_cache(cache_df)
         print(f"已补齐日线数据：{trade_date}")
 
     if cache_df.empty:
@@ -918,6 +999,10 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     all_daily = load_all_daily(ts_codes, trade_dates)
     if all_daily.empty:
         return pd.DataFrame()
+    if TOTAL_MV_FILTER_ENABLED:
+        # 总市值过滤按最近一个交易日口径执行，不跟随历史信号日回溯。
+        latest_total_mv_df = load_latest_total_mv(ts_codes, trade_dates[-1])
+        all_daily = all_daily.merge(latest_total_mv_df, on=["ts_code"], how="left")
     all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
     if not all_basic.empty:
         all_daily = all_daily.merge(
@@ -928,11 +1013,11 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     required_basic_columns = ["volume_ratio", "turnover_rate", "pe"]
     if EPS_FILTER_ENABLED:
         required_basic_columns.append("eps")
-    if TOTAL_MV_FILTER_ENABLED:
-        required_basic_columns.append("total_mv")
     for col in required_basic_columns:
         if col not in all_daily.columns:
             all_daily[col] = pd.NA
+    if TOTAL_MV_FILTER_ENABLED and "total_mv" not in all_daily.columns:
+        all_daily["total_mv"] = pd.NA
     moneyflow_needed = (
         CONDITION_FLAGS["external_internal_ratio_high"]
         or CONDITION_FLAGS["main_money_inflow_2days"]
