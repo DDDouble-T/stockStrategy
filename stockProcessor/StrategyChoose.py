@@ -259,32 +259,13 @@ def read_daily_cache_file(cache_file):
     return normalize_daily_cache_df(df)
 
 
-def load_legacy_daily_cache():
-    if not os.path.exists(DAILY_CACHE_CSV):
-        return pd.DataFrame()
-
-    df = pd.read_csv(DAILY_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
-    return normalize_daily_cache_df(df)
-
-
 def load_daily_cache(trade_dates):
     cached_frames = []
     cached_dates = set()
-    legacy_cache_df = None
 
     for trade_date in trade_dates:
         cache_file = get_daily_cache_file_path(trade_date)
         date_df = read_daily_cache_file(cache_file)
-
-        if date_df.empty and os.path.exists(DAILY_CACHE_CSV):
-            if legacy_cache_df is None:
-                legacy_cache_df = load_legacy_daily_cache()
-            if not legacy_cache_df.empty and "trade_date" in legacy_cache_df.columns:
-                date_df = legacy_cache_df[legacy_cache_df["trade_date"] == str(trade_date)].copy()
-                if not date_df.empty:
-                    # 首次切换时兼容旧总文件缓存，迁移后后续命中直接按单日文件读取。
-                    save_daily_cache(date_df)
-                    print(f"已迁移日线缓存到单日文件：{trade_date}")
 
         if date_df.empty:
             continue
