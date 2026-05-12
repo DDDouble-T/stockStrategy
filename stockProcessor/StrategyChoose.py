@@ -9,6 +9,7 @@ from openpyxl.utils import get_column_letter
 from module.basic import basic_api
 from module.config import tushare_config
 from stockProcessor import eps_download as eps_downloader
+from stockProcessor import prev_year_high_dividend_download as dividend_downloader
 from stockProcessor.download.constants import data_path, score_result_path
 import strategy_choose_config
 
@@ -42,7 +43,6 @@ MAX_FORWARD_DAYS = RUNTIME_CONFIG["max_forward_days"]
 VOL_MA_DAYS = RUNTIME_CONFIG["vol_ma_days"]
 RSI_PERIOD = RUNTIME_CONFIG["rsi_period"]
 DAILY_CACHE_CSV = data_path("strategy_daily_cache.csv")
-DIVIDEND_CACHE_CSV = data_path("strategy_dividend_cache.csv")
 BASIC_CACHE_CSV = data_path("strategy_basic_cache.csv")
 SHAREHOLDER_CACHE_CSV = data_path("strategy_shareholder_cache.csv")
 MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
@@ -656,70 +656,23 @@ def get_social_security_holder_flag(ts_code, shareholder_cache_ref):
 
 
 def load_dividend_cache():
-    if not os.path.exists(DIVIDEND_CACHE_CSV):
-        return pd.DataFrame(columns=["ts_code", "dividend_year", "cash_div_tax"])
-
-    df = pd.read_csv(
-        DIVIDEND_CACHE_CSV,
-        dtype={"ts_code": str, "dividend_year": str}
-    )
-    if "cash_div_tax" in df.columns:
-        df["cash_div_tax"] = pd.to_numeric(df["cash_div_tax"], errors="coerce").fillna(0)
-    return df
+    return dividend_downloader.load_dividend_cache()
 
 
 def save_dividend_cache(df):
-    os.makedirs(os.path.dirname(DIVIDEND_CACHE_CSV), exist_ok=True)
-    df = df.drop_duplicates(subset=["ts_code", "dividend_year"], keep="last")
-    df = df.sort_values(by=["dividend_year", "ts_code"]).reset_index(drop=True)
-    df.to_csv(DIVIDEND_CACHE_CSV, index=False, encoding="utf-8-sig")
+    dividend_downloader.save_dividend_cache(df)
 
 
 def fetch_prev_year_cash_div_tax(ts_code, dividend_year):
-    pro = pro_api()
-    df = pro.dividend(
-        ts_code=ts_code,
-        fields="ts_code,end_date,div_proc,cash_div,cash_div_tax,record_date,ex_date,pay_date"
-    )
-    if df.empty or "end_date" not in df.columns:
-        return 0
-
-    df["end_date"] = df["end_date"].astype(str)
-    year_df = df[df["end_date"].str.startswith(str(dividend_year))]
-    if year_df.empty:
-        return 0
-
-    cash_col = "cash_div_tax" if "cash_div_tax" in year_df.columns else "cash_div"
-    return pd.to_numeric(year_df[cash_col], errors="coerce").fillna(0).sum()
+    return dividend_downloader.fetch_prev_year_cash_div_tax(ts_code, dividend_year)
 
 
 def get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref):
-    cache_df = dividend_cache_ref["df"]
-    year = str(dividend_year)
-    cached = cache_df[
-        (cache_df["ts_code"] == ts_code)
-        & (cache_df["dividend_year"].astype(str) == year)
-    ]
-    if not cached.empty:
-        return cached.iloc[-1]["cash_div_tax"]
-
-    cash_div_tax = fetch_prev_year_cash_div_tax(ts_code, dividend_year)
-    new_row = pd.DataFrame([{
-        "ts_code": ts_code,
-        "dividend_year": year,
-        "cash_div_tax": cash_div_tax
-    }])
-    if cache_df.empty:
-        dividend_cache_ref["df"] = new_row
-    else:
-        dividend_cache_ref["df"] = pd.concat([cache_df, new_row], ignore_index=True)
-    dividend_cache_ref["dirty"] = True
-    return cash_div_tax
+    return dividend_downloader.get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref)
 
 
 def is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref):
-    cash_div_tax = get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref)
-    return cash_div_tax >= PREV_YEAR_MIN_CASH_DIV_TAX
+    return dividend_downloader.is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref)
 
 
 def load_all_daily(ts_codes, trade_dates):
@@ -1233,8 +1186,21 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     results = []
     stats = {}
     dividend_year = int(end_date[:4]) - 1
+    dividend_cache_df = pd.DataFrame()
+    if CONDITION_FLAGS["prev_year_high_dividend"]:
+        candidate_ts_codes = (
+            filtered_signal_df["ts_code"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        dividend_cache_df = dividend_downloader.download_prev_year_high_dividend_for_ts_codes(
+            candidate_ts_codes,
+            dividend_year
+        )
     dividend_cache_ref = {
-        "df": load_dividend_cache() if CONDITION_FLAGS["prev_year_high_dividend"] else pd.DataFrame(),
+        "df": dividend_cache_df if CONDITION_FLAGS["prev_year_high_dividend"] else pd.DataFrame(),
         "dirty": False
     }
     shareholder_cache_ref = {
