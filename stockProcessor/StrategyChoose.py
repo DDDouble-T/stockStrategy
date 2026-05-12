@@ -879,30 +879,35 @@ def build_industry_relative_valuation_result(
     reason = pd.Series("通过", index=df.index, dtype=object)
 
     pe_missing = pe_series.isna()
-    reason = reason.mask(pe_missing, "PE缺失")
-    passed &= ~pe_missing
+    reason = reason.mask(pe_missing, "PE缺失，跳过行业估值过滤")
 
-    absolute_pe_ok = (pe_series > min_pe) & (pe_series <= max_pe)
-    absolute_pe_invalid = passed & ~absolute_pe_ok
+    pe_below_min = pe_series.notna() & (pe_series < min_pe)
+    reason = reason.mask(pe_below_min, "市盈率小于0")
+    passed &= ~pe_below_min
+
+    pe_above_max = pe_series.notna() & (pe_series > max_pe)
+    absolute_pe_invalid = passed & pe_above_max
     reason = reason.mask(absolute_pe_invalid, "市盈率不达标")
-    passed &= absolute_pe_ok
+    passed &= ~pe_above_max
+
+    pe_needs_industry_eval = passed & pe_series.notna()
 
     metrics_ready = stock_count.notna() & percentile.notna() & ratio_to_median.notna()
-    metrics_missing = passed & ~metrics_ready
+    metrics_missing = pe_needs_industry_eval & ~metrics_ready
     reason = reason.mask(metrics_missing, "行业估值数据不足")
-    passed &= metrics_ready
+    passed &= ~pe_needs_industry_eval | metrics_ready
 
     sample_small = stock_count < min_sample_count
-    fallback_mask = passed & sample_small
+    fallback_mask = pe_needs_industry_eval & metrics_ready & sample_small
     reason = reason.mask(fallback_mask, "行业样本不足，回退绝对PE")
 
-    percentile_too_high = passed & ~sample_small & (percentile > max_percentile)
+    percentile_too_high = pe_needs_industry_eval & metrics_ready & ~sample_small & (percentile > max_percentile)
     reason = reason.mask(percentile_too_high, "行业估值分位不够低")
-    passed &= sample_small | (percentile <= max_percentile)
+    passed &= ~pe_needs_industry_eval | sample_small | (percentile <= max_percentile)
 
-    ratio_too_high = passed & ~sample_small & (ratio_to_median > max_ratio_to_median)
+    ratio_too_high = pe_needs_industry_eval & metrics_ready & ~sample_small & (ratio_to_median > max_ratio_to_median)
     reason = reason.mask(ratio_too_high, "相对行业中位数折价不足")
-    passed &= sample_small | (ratio_to_median <= max_ratio_to_median)
+    passed &= ~pe_needs_industry_eval | sample_small | (ratio_to_median <= max_ratio_to_median)
 
     return pd.DataFrame({
         "industry_relative_valuation_low": passed,
