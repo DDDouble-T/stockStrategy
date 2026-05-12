@@ -26,20 +26,10 @@ UPDATE_START_DATE = None
 
 
 def load_strategy_runtime_config():
-    preset_name = strategy_choose_config.ACTIVE_STRATEGY
-    preset = strategy_choose_config.STRATEGY_PRESETS.get(preset_name)
-    if preset is None:
-        raise ValueError(f"未找到策略配置: {preset_name}")
-
+    # 下载脚本只负责构建稳定缓存，不应随着 ACTIVE_STRATEGY 切换而改变下载口径。
+    # 这里固定基于默认配置，避免选股 preset 影响基础数据准备。
     config = deepcopy(strategy_choose_config.DEFAULT_CONFIG)
-    preset_conditions = preset.get("conditions", {})
-    config["conditions"].update(preset_conditions)
-    for key, value in preset.items():
-        if key == "conditions":
-            continue
-        config[key] = value
-
-    config["strategy_name"] = preset_name
+    config["strategy_name"] = "default_download"
     return config
 
 
