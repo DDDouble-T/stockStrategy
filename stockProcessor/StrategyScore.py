@@ -14,7 +14,7 @@ StrategyScore.py
 - score = max(0, raw_score)，仅用于展示；
 - 回撤惩罚采用“周期容忍回撤”机制，只惩罚超过正常波动的部分；
 - 不再鼓励大样本：新增“筛选密度惩罚”，筛出太多股票会扣分；
-- 筛选密度分母使用 EPS 基础过滤 + ST/BJ 过滤之后的候选信号池；
+- 筛选密度分母使用 EPS + PE 基础过滤 + ST/BJ 过滤之后的候选信号池；
 - 样本惩罚仅保留极小样本轻惩罚，避免精选策略被大幅压分；
 - 收益分权重上调，让策略排名更偏向真实收益兑现能力。
 
@@ -73,10 +73,11 @@ EXCLUDE_BJ = True
 # ----------------------
 # 基础过滤 / 交易热度阈值
 # ----------------------
-# EPS、总市值和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
+# EPS、PE、总市值和 ST 是基础过滤：先排掉，再计算“总股票数量/候选信号池”。
 # EPS 如果 daily_basic 没直接给，会用 close / pe_ttm 或 close / pe 粗略反推。
 MIN_EPS = getattr(sc, "MIN_EPS", 0.0)
 EPS_FILTER_ENABLED = getattr(sc, "EPS_FILTER_ENABLED", MIN_EPS is not None)
+PE_FILTER_ENABLED = getattr(sc, "PE_FILTER_ENABLED", False)
 MIN_TOTAL_MV = getattr(sc, "MIN_TOTAL_MV", None)
 TOTAL_MV_FILTER_ENABLED = getattr(sc, "TOTAL_MV_FILTER_ENABLED", MIN_TOTAL_MV is not None)
 
@@ -99,7 +100,7 @@ MAX_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MAX_EXTERNAL_INTERNAL_RATIO", 2.50)
 # ----------------------
 # 筛选密度惩罚
 # ----------------------
-# selection_rate = 当前策略命中样本数 / EPS+总市值+ST/BJ过滤后的候选信号总数。
+# selection_rate = 当前策略命中样本数 / EPS+PE+总市值+ST/BJ过滤后的候选信号总数。
 # 例如 5000只股票 * 120个信号日，经 EPS/总市值/ST/BJ 过滤后可能剩 420000 行候选信号。
 # 如果某组合命中 20000 行，selection_rate≈4.76%，说明太宽，会扣分。
 TARGET_SELECTION_RATE = 0.005   # <=0.5%：精选，不扣分
@@ -125,7 +126,7 @@ BUCKET_LABELS = ["<=-10%", "-10~-5%", "-5~-3%", "-3~0%", "0~3%", "3~5%", "5~10%"
 # 条件定义区
 # ======================
 
-# EPS 和 ST 属于基础过滤：先排除不合格样本，不参与策略条件组合评分。
+# EPS、PE 和 ST 属于基础过滤：先排除不合格样本，不参与策略条件组合评分。
 # 这里默认不加入 prev_year_high_dividend，因为你这次描述的策略没有包含分红条件。
 # 分红偏基本面，和 3/10/20/30 个交易日的短中线表现不一定强相关。
 CONDITION_KEYS = [
@@ -137,7 +138,7 @@ CONDITION_KEYS = [
     "volume_ratio_high",             # 量比达标
     "external_internal_ratio_high",  # 外盘 / 内盘达标
     "turnover_rate_range",           # 换手率在合理区间
-    "pe_reasonable",                 # 市盈率合理
+    "industry_relative_valuation_low",  # 行业样本不足回退绝对PE，否则要求相对行业低估
     "social_security_holder",        # 股东成分包含全国社保基金（如果 StrategyChoose 支持）
     "main_money_inflow_2days",       # 主力资金连续流入2天
 ]
@@ -152,7 +153,7 @@ CONDITION_NAME = {
     "volume_ratio_high": "量比合理",
     "external_internal_ratio_high": "外盘/内盘达标",
     "turnover_rate_range": "换手率合理",
-    "pe_reasonable": "市盈率合理",
+    "industry_relative_valuation_low": "相对行业低估",
     "social_security_holder": "含全国社保基金",
     "main_money_inflow_2days": "主力连续流入2天",
 }
@@ -317,11 +318,13 @@ def print_basic_filter_stock_counts(all_daily: pd.DataFrame, signal_dates: list,
     if all_daily.empty:
         print(f"基础过滤前股票数（ST/BJ过滤后）：{stock_pool_count}")
         print("EPS过滤后股票数：0")
+        print("PE过滤后股票数：0")
         print("总市值过滤后股票数：0")
         return
 
     signal_date_set = set(signal_dates)
     eps_stock_codes = set()
+    pe_stock_codes = set()
     total_mv_stock_codes = set()
 
     for ts_code, raw_df in all_daily.groupby("ts_code"):
@@ -350,17 +353,25 @@ def print_basic_filter_stock_counts(all_daily: pd.DataFrame, signal_dates: list,
         if EPS_FILTER_ENABLED:
             eps_mask &= signal_df["eps"].isna() | (signal_df["eps"] >= MIN_EPS)
 
+        pe_mask = pd.Series(True, index=signal_df.index)
+        if PE_FILTER_ENABLED:
+            pe_for_filter = signal_df["pe_ttm"].where(signal_df["pe_ttm"] > 0, signal_df["pe"])
+            pe_mask &= pe_for_filter.isna() | ((pe_for_filter > MIN_PE) & (pe_for_filter <= MAX_PE))
+
         total_mv_mask = pd.Series(True, index=signal_df.index)
         if TOTAL_MV_FILTER_ENABLED:
             total_mv_mask &= signal_df["total_mv"].isna() | (signal_df["total_mv"] > MIN_TOTAL_MV)
 
         if bool(eps_mask.any()):
             eps_stock_codes.add(ts_code)
+        if bool(pe_mask.any()):
+            pe_stock_codes.add(ts_code)
         if bool(total_mv_mask.any()):
             total_mv_stock_codes.add(ts_code)
 
     print(f"基础过滤前股票数（ST/BJ过滤后）：{stock_pool_count}")
     print(f"EPS过滤后股票数（信号窗口内至少1天通过EPS）：{len(eps_stock_codes)}")
+    print(f"PE过滤后股票数（信号窗口内至少1天通过PE）：{len(pe_stock_codes)}")
     print(f"总市值过滤后股票数（最近交易日总市值通过）：{len(total_mv_stock_codes)}")
 
 
@@ -383,8 +394,8 @@ def build_condition_base_df(
 
     重要：
     - ST/BJ 在股票池阶段过滤；
-    - EPS、总市值在这里做基础过滤；
-    - 因此 base_df 的总行数就是“EPS + 总市值 + ST/BJ 过滤之后的候选信号总数”，
+    - EPS、PE、总市值在这里做基础过滤；
+    - 因此 base_df 的总行数就是“EPS + PE + 总市值 + ST/BJ 过滤之后的候选信号总数”，
       后续筛选密度惩罚会用它作为分母。
     """
     if all_daily.empty:
@@ -447,6 +458,12 @@ def build_condition_base_df(
             df["eps_basic_filter"] = True
             if EPS_FILTER_ENABLED:
                 df["eps_basic_filter"] = df["eps"].isna() | (df["eps"] >= MIN_EPS)
+
+            df["pe_basic_filter"] = True
+            if PE_FILTER_ENABLED:
+                pe_for_filter = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+                df["pe_basic_filter"] = pe_for_filter.isna() | ((pe_for_filter > MIN_PE) & (pe_for_filter <= MAX_PE))
+
             df["volume_ratio_high"] = (
                 (df["volume_ratio"] >= MIN_VOLUME_RATIO)
                 & (df["volume_ratio"] <= MAX_VOLUME_RATIO)
@@ -467,8 +484,14 @@ def build_condition_base_df(
                 & (df["turnover_rate"] <= MAX_TURNOVER_RATE)
             )
 
-            pe_for_filter = df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
-            df["pe_reasonable"] = (pe_for_filter > MIN_PE) & (pe_for_filter <= MAX_PE)
+            valuation_result = sc.build_industry_relative_valuation_result(
+                df,
+                pe_column="pe",
+                min_pe=MIN_PE,
+                max_pe=MAX_PE,
+            )
+            df["industry_relative_valuation_low"] = valuation_result["industry_relative_valuation_low"]
+            df["industry_relative_valuation_reason"] = valuation_result["industry_relative_valuation_reason"]
 
             holder_flag = get_social_security_holder_flag_safe(ts_code, shareholder_cache_ref)
             df["social_security_holder"] = holder_flag
@@ -491,8 +514,10 @@ def build_condition_base_df(
                 if pd.isna(base_close) or base_close <= 0:
                     continue
 
-                # EPS 基础过滤关闭时，缺失 EPS 不会影响候选池。
+                # EPS/PE 基础过滤关闭时，缺失值不会影响候选池。
                 if EPS_FILTER_ENABLED and not bool(row["eps_basic_filter"]):
+                    continue
+                if PE_FILTER_ENABLED and not bool(row["pe_basic_filter"]):
                     continue
                 if TOTAL_MV_FILTER_ENABLED and pd.notna(row["total_mv"]) and row["total_mv"] <= MIN_TOTAL_MV:
                     continue
@@ -590,6 +615,8 @@ def calc_small_sample_penalty(sample_count: int) -> float:
         return 8.0
     if sample_count < 10:
         return 3.0
+    if sample_count < 30:
+        return 1.0
     return 0.0
 
 
@@ -597,7 +624,7 @@ def calc_selection_penalty(selection_rate: float) -> float:
     """
     筛选密度惩罚。
 
-    selection_rate = 命中样本数 / EPS+总市值+ST/BJ 过滤后的候选信号总数。
+    selection_rate = 命中样本数 / EPS+PE+总市值+ST/BJ 过滤后的候选信号总数。
 
     设计目标：
     - 你希望每天筛出的是少量精选票，而不是几百只大样本；
@@ -610,12 +637,13 @@ def calc_selection_penalty(selection_rate: float) -> float:
     - >2%：明显扣分。
     """
     if pd.isna(selection_rate) or selection_rate <= 0:
-        return 0.0
-    if selection_rate <= TARGET_SELECTION_RATE:
-        return 0.0
-    if selection_rate <= MAX_OK_SELECTION_RATE:
-        return (selection_rate - TARGET_SELECTION_RATE) * 500.0
-    return 7.5 + (selection_rate - MAX_OK_SELECTION_RATE) * 1000.0
+        return 10.0
+    return abs(selection_rate - TARGET_SELECTION_RATE) * 1000
+    # if selection_rate <= TARGET_SELECTION_RATE:
+    #     return 0.0
+    # if selection_rate <= MAX_OK_SELECTION_RATE:
+    #     return (selection_rate - TARGET_SELECTION_RATE) * 500.0
+    # return 7.5 + (selection_rate - MAX_OK_SELECTION_RATE) * 1000.0
 
 
 def calc_period_score(metric: dict, forward_day: int) -> dict:
@@ -743,7 +771,7 @@ def evaluate_combos(base_df: pd.DataFrame):
     gradient_rows = []
     detail_rows = []
 
-    # 这里的分母已经是 EPS + ST/BJ 过滤后的候选信号池。
+    # 这里的分母已经是 EPS + PE + 总市值 + ST/BJ 过滤后的候选信号池。
     # base_df 每一行 = 某只股票在某个候选信号日。
     candidate_signal_count = len(base_df)
     candidate_stock_count = base_df["ts_code"].nunique() if not base_df.empty else 0
@@ -978,7 +1006,11 @@ def save_outputs(rank_df, period_df, gradient_df, detail_df, base_df, run_summar
 # ======================
 
 def main():
-    end_date = sc.get_latest_completed_trade_date()
+    moneyflow_needed = (
+        "main_money_inflow_2days" in CONDITION_KEYS
+        or "external_internal_ratio_high" in CONDITION_KEYS
+    )
+    end_date = sc.get_latest_completed_trade_date(require_moneyflow=moneyflow_needed)
     trade_dates = get_score_trade_dates(end_date)
     signal_dates = trade_dates[-BACKTEST_SIGNAL_DAYS:]
 
@@ -1016,11 +1048,13 @@ def main():
     for col in basic_columns:
         if col not in all_daily.columns:
             all_daily[col] = pd.NA
+    if hasattr(sc, "add_industry_valuation_metrics"):
+        all_daily = sc.add_industry_valuation_metrics(all_daily, stock_pool)
     print_basic_filter_stock_counts(all_daily, signal_dates, len(ts_codes))
 
     # 只要条件组合里包含资金流/内外盘相关条件，就需要资金流预计算。
     moneyflow_df = pd.DataFrame()
-    if "main_money_inflow_2days" in CONDITION_KEYS or "external_internal_ratio_high" in CONDITION_KEYS:
+    if moneyflow_needed:
         # 需要覆盖候选信号日以及它的前一日。
         signal_start_index = trade_dates.index(signal_dates[0])
         moneyflow_dates = trade_dates[max(0, signal_start_index - 1):]
@@ -1039,7 +1073,7 @@ def main():
         shareholder_cache_ref,
     )
     if base_df.empty:
-        print("没有生成候选信号表，请检查数据窗口、EPS过滤、ST过滤或股票池")
+        print("没有生成候选信号表，请检查数据窗口、EPS/PE/总市值过滤、ST过滤或股票池")
         return
 
     if shareholder_cache_ref.get("dirty"):
@@ -1052,7 +1086,7 @@ def main():
 
     print(
         f"候选信号表：{candidate_signal_count} 行；"
-        f"EPS+总市值+ST/BJ过滤后股票数：{candidate_stock_count}；"
+        f"EPS+PE+总市值+ST/BJ过滤后股票数：{candidate_stock_count}；"
         f"平均每天候选数：{avg_candidate_per_day:.2f}"
     )
 

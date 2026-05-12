@@ -41,8 +41,15 @@ DEFAULT_CONFIG = {
     "min_turnover_rate": 1.0,
     # 换手率上限，单位为百分比，12.0 表示 12%。
     "max_turnover_rate": 12.0,
-    # 市盈率上限；同时会过滤小于等于 0 的市盈率。
+    # 市盈率基础过滤上限；仅在 conditions.pe_reasonable 为 True 时启用。
+    # 与 EPS 一致，只有 pe 有值且不在合理区间内才过滤，pe 为空时放行。
     "max_pe": 80.0,
+    # 行业内参与估值对比的最小样本数，过少时行业中位数代表性不足。
+    "industry_pe_min_sample_count": 5,
+    # 个股 PE 在所属行业中的最高分位阈值。0.35 表示要求处于行业内更低的 35% 区间。
+    "industry_pe_max_percentile": 0.35,
+    # 个股 PE / 所属行业 PE 中位数 的上限。0.8 表示至少比行业中位数低 20%。
+    "industry_pe_max_ratio_to_median": 0.8,
     # 是否排除名称包含 ST 的股票，包括 ST、*ST 等风险股。
     "exclude_st_stocks": True,
     # 条件开关说明：
@@ -55,7 +62,8 @@ DEFAULT_CONFIG = {
     # volume_ratio_high: 量比不低于
     # external_internal_ratio_high: 外盘 / 内盘不低于1.05
     # turnover_rate_range: 换手率在设定区间内 1-12
-    # pe_reasonable: 市盈率在合理区间 0-80
+    # pe_reasonable: 启用市盈率基础过滤，要求 PE 在合理区间 0-80；pe 为空时放行
+    # industry_relative_valuation_low: 相对所属行业处于低估值区间
     # social_security_holder: 股东成分包含全国社保基金
     # prev_year_high_dividend: 上一年度现金分红较高，10股税前大于1
     # main_money_inflow_2days: 主力资金连续流入2天
@@ -70,6 +78,7 @@ DEFAULT_CONFIG = {
         "external_internal_ratio_high": False,
         "turnover_rate_range": True,
         "pe_reasonable": True,
+        "industry_relative_valuation_low": False,
         "social_security_holder": False,
         "prev_year_high_dividend": False,
         "main_money_inflow_2days": True,
@@ -114,6 +123,29 @@ STRATEGY_PRESETS = {
             "turnover_rate_range": False,
             "pe_reasonable": True,
             "social_security_holder": True,
+            "main_money_inflow_2days": False,
+        },
+    },
+    "undervalued_industry": {
+        "description": "低估值策略：筛选 PE 处于所属行业低位、且相对行业中位数有明显折价的股票。",
+        "signal_days": 5,
+        "max_pe": 30.0,
+        "industry_pe_max_percentile": 0.35,
+        "industry_pe_max_ratio_to_median": 0.8,
+        "conditions": {
+            "trend_above_ma20": False,
+            "bullish_ma_alignment": False,
+            "volume_rule": False,
+            "position_rule": False,
+            "macd_golden_cross": False,
+            "rsi_not_overheated": False,
+            "volume_ratio_high": False,
+            "external_internal_ratio_high": False,
+            "turnover_rate_range": False,
+            "pe_reasonable": True,
+            "industry_relative_valuation_low": True,
+            "social_security_holder": False,
+            "prev_year_high_dividend": False,
             "main_money_inflow_2days": False,
         },
     },

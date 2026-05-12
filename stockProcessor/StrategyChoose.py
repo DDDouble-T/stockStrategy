@@ -68,7 +68,11 @@ MIN_VOLUME_RATIO = RUNTIME_CONFIG["min_volume_ratio"]
 MIN_EXTERNAL_INTERNAL_RATIO = RUNTIME_CONFIG["min_external_internal_ratio"]
 MIN_TURNOVER_RATE = RUNTIME_CONFIG["min_turnover_rate"]
 MAX_TURNOVER_RATE = RUNTIME_CONFIG["max_turnover_rate"]
-MAX_PE = RUNTIME_CONFIG["max_pe"]
+MAX_PE = normalize_optional_number(RUNTIME_CONFIG["max_pe"])
+PE_FILTER_ENABLED = bool(CONDITION_FLAGS.get("pe_reasonable", False)) and MAX_PE is not None
+INDUSTRY_PE_MIN_SAMPLE_COUNT = int(RUNTIME_CONFIG.get("industry_pe_min_sample_count", 5))
+INDUSTRY_PE_MAX_PERCENTILE = float(RUNTIME_CONFIG.get("industry_pe_max_percentile", 0.35))
+INDUSTRY_PE_MAX_RATIO_TO_MEDIAN = float(RUNTIME_CONFIG.get("industry_pe_max_ratio_to_median", 0.8))
 
 CONDITION_NAMES = {
     "trend_above_ma20": "股价在20日线之上",
@@ -81,6 +85,7 @@ CONDITION_NAMES = {
     "external_internal_ratio_high": "外盘/内盘达标",
     "turnover_rate_range": "换手率在设定区间",
     "pe_reasonable": "市盈率合理",
+    "industry_relative_valuation_low": "相对行业估值偏低",
     "social_security_holder": "股东成分包含全国社保基金",
     "prev_year_high_dividend": "上一年度现金分红较高",
     "main_money_inflow_2days": "主力资金连续流入2天",
@@ -113,7 +118,37 @@ def get_trade_dates(end_date, count=80):
     return cal["cal_date"].tolist()[-count:]
 
 
-def get_latest_completed_trade_date(now=None):
+def resolve_trade_date_with_required_data(target_date, require_moneyflow=False, lookback_count=20):
+    """
+    从 target_date 往前寻找“所需数据都已就绪”的最近交易日。
+    daily 是基础要求；当策略依赖资金流条件时，moneyflow 也必须可用。
+    """
+    candidate_dates = get_trade_dates(target_date, count=max(2, lookback_count))
+    if not candidate_dates:
+        raise ValueError(f"未获取到 {target_date} 之前的可用交易日，请检查交易日历接口")
+
+    latest_candidate = candidate_dates[-1]
+    pro = pro_api()
+    required_data_desc = "daily"
+    if require_moneyflow:
+        required_data_desc = "daily + moneyflow"
+
+    for trade_date in reversed(candidate_dates):
+        daily_df = pro.daily(trade_date=trade_date)
+        if daily_df.empty:
+            continue
+        if require_moneyflow:
+            moneyflow_df = pro.moneyflow(trade_date=trade_date)
+            if moneyflow_df.empty:
+                continue
+        if trade_date != latest_candidate:
+            print(f"目标交易日 {latest_candidate} 的 {required_data_desc} 数据未就绪，回退到 {trade_date}")
+        return trade_date
+
+    raise ValueError(f"最近交易日均未获取到可用的 {required_data_desc} 数据，请检查 TuShare 接口")
+
+
+def get_latest_completed_trade_date(now=None, require_moneyflow=False):
     if now is None:
         now = datetime.now()
 
@@ -130,25 +165,17 @@ def get_latest_completed_trade_date(now=None):
     if not trade_dates:
         raise ValueError("未获取到可用交易日，请检查交易日历接口")
 
-    if trade_dates[-1] != today:
-        candidate_dates = trade_dates
-    elif now.hour >= MARKET_CLOSE_HOUR:
-        candidate_dates = trade_dates
+    if trade_dates[-1] != today or now.hour >= MARKET_CLOSE_HOUR:
+        latest_candidate = trade_dates[-1]
     else:
         if len(trade_dates) < 2:
             raise ValueError("当前交易日未结束，且没有可用的上一交易日")
-        candidate_dates = trade_dates[:-1]
+        latest_candidate = trade_dates[-2]
 
-    # TuShare daily 数据可能晚于收盘时间发布。必须确认数据已经可用，
-    # 否则会把“交易日历已结束但行情未发布”的日期带入后续计算。
-    for trade_date in reversed(candidate_dates):
-        daily_df = pro.daily(trade_date=trade_date)
-        if not daily_df.empty:
-            if trade_date != candidate_dates[-1]:
-                print(f"最近交易日 {candidate_dates[-1]} daily 数据未就绪，回退到 {trade_date}")
-            return trade_date
-
-    raise ValueError("最近交易日均未获取到 daily 数据，请检查 TuShare daily 接口")
+    return resolve_trade_date_with_required_data(
+        latest_candidate,
+        require_moneyflow=require_moneyflow,
+    )
 
 
 def calc_rsi(close, period=6):
@@ -737,6 +764,127 @@ def add_stat(stats, key):
         stats[key] = stats.get(key, 0) + 1
 
 
+def build_industry_relative_valuation_result(
+    df,
+    pe_column="pe",
+    min_pe=0.0,
+    max_pe=MAX_PE,
+    min_sample_count=INDUSTRY_PE_MIN_SAMPLE_COUNT,
+    max_percentile=INDUSTRY_PE_MAX_PERCENTILE,
+    max_ratio_to_median=INDUSTRY_PE_MAX_RATIO_TO_MEDIAN,
+):
+    pe_series = pd.to_numeric(df.get(pe_column), errors="coerce")
+    stock_count = pd.to_numeric(df.get("industry_stock_count"), errors="coerce")
+    percentile = pd.to_numeric(df.get("industry_pe_percentile"), errors="coerce")
+    ratio_to_median = pd.to_numeric(df.get("industry_pe_ratio_to_median"), errors="coerce")
+
+    passed = pd.Series(True, index=df.index, dtype=bool)
+    reason = pd.Series("通过", index=df.index, dtype=object)
+
+    pe_missing = pe_series.isna()
+    reason = reason.mask(pe_missing, "PE缺失")
+    passed &= ~pe_missing
+
+    absolute_pe_ok = (pe_series > min_pe) & (pe_series <= max_pe)
+    absolute_pe_invalid = passed & ~absolute_pe_ok
+    reason = reason.mask(absolute_pe_invalid, "市盈率不达标")
+    passed &= absolute_pe_ok
+
+    metrics_ready = stock_count.notna() & percentile.notna() & ratio_to_median.notna()
+    metrics_missing = passed & ~metrics_ready
+    reason = reason.mask(metrics_missing, "行业估值数据不足")
+    passed &= metrics_ready
+
+    sample_small = stock_count < min_sample_count
+    fallback_mask = passed & sample_small
+    reason = reason.mask(fallback_mask, "行业样本不足，回退绝对PE")
+
+    percentile_too_high = passed & ~sample_small & (percentile > max_percentile)
+    reason = reason.mask(percentile_too_high, "行业估值分位不够低")
+    passed &= sample_small | (percentile <= max_percentile)
+
+    ratio_too_high = passed & ~sample_small & (ratio_to_median > max_ratio_to_median)
+    reason = reason.mask(ratio_too_high, "相对行业中位数折价不足")
+    passed &= sample_small | (ratio_to_median <= max_ratio_to_median)
+
+    return pd.DataFrame({
+        "industry_relative_valuation_low": passed,
+        "industry_relative_valuation_reason": reason,
+    }, index=df.index)
+
+
+def add_industry_valuation_metrics(all_daily, stock_pool):
+    if all_daily.empty:
+        return all_daily
+
+    industry_df = stock_pool[["ts_code", "industry"]].copy()
+    merged = all_daily.merge(industry_df, on="ts_code", how="left")
+    merged["industry"] = merged["industry"].fillna("").astype(str)
+    merged["pe"] = pd.to_numeric(merged["pe"], errors="coerce")
+
+    valid_pe_mask = (
+        merged["industry"].ne("")
+        & merged["industry"].ne("None")
+        & merged["pe"].notna()
+        & (merged["pe"] > 0)
+    )
+    valid_pe_df = merged.loc[valid_pe_mask, ["trade_date", "industry", "ts_code", "pe"]].copy()
+
+    metric_columns = [
+        "trade_date",
+        "industry",
+        "ts_code",
+        "industry_stock_count",
+        "industry_pe_mean",
+        "industry_pe_median",
+        "industry_pe_percentile",
+        "industry_pe_ratio_to_mean",
+        "industry_pe_ratio_to_median",
+        "industry_pe_discount_to_mean_pct",
+        "industry_pe_discount_to_median_pct",
+    ]
+    if valid_pe_df.empty:
+        for col in metric_columns[3:]:
+            merged[col] = pd.NA
+        valuation_result = build_industry_relative_valuation_result(merged)
+        merged["industry_relative_valuation_low"] = valuation_result["industry_relative_valuation_low"]
+        merged["industry_relative_valuation_reason"] = valuation_result["industry_relative_valuation_reason"]
+        return merged
+
+    industry_stats = (
+        valid_pe_df.groupby(["trade_date", "industry"])["pe"]
+        .agg(
+            industry_stock_count="count",
+            industry_pe_mean="mean",
+            industry_pe_median="median",
+        )
+        .reset_index()
+    )
+
+    valid_pe_df = valid_pe_df.sort_values(["trade_date", "industry", "pe", "ts_code"]).reset_index(drop=True)
+    valid_pe_df["industry_pe_rank"] = valid_pe_df.groupby(["trade_date", "industry"]).cumcount() + 1
+    valid_pe_df = valid_pe_df.merge(industry_stats, on=["trade_date", "industry"], how="left")
+    valid_pe_df["industry_pe_percentile"] = valid_pe_df["industry_pe_rank"] / valid_pe_df["industry_stock_count"]
+    valid_pe_df["industry_pe_ratio_to_mean"] = valid_pe_df["pe"] / valid_pe_df["industry_pe_mean"].where(
+        valid_pe_df["industry_pe_mean"] > 0
+    )
+    valid_pe_df["industry_pe_ratio_to_median"] = valid_pe_df["pe"] / valid_pe_df["industry_pe_median"].where(
+        valid_pe_df["industry_pe_median"] > 0
+    )
+    valid_pe_df["industry_pe_discount_to_mean_pct"] = (
+        1 - valid_pe_df["industry_pe_ratio_to_mean"]
+    ) * 100
+    valid_pe_df["industry_pe_discount_to_median_pct"] = (
+        1 - valid_pe_df["industry_pe_ratio_to_median"]
+    ) * 100
+
+    merged = merged.merge(valid_pe_df[metric_columns], on=["trade_date", "industry", "ts_code"], how="left")
+    valuation_result = build_industry_relative_valuation_result(merged)
+    merged["industry_relative_valuation_low"] = valuation_result["industry_relative_valuation_low"]
+    merged["industry_relative_valuation_reason"] = valuation_result["industry_relative_valuation_reason"]
+    return merged
+
+
 def print_basic_filter_stock_counts(all_daily, signal_dates, stock_pool_count):
     signal_df = all_daily[all_daily["trade_date"].isin(set(signal_dates))].copy()
     if signal_df.empty:
@@ -744,15 +892,22 @@ def print_basic_filter_stock_counts(all_daily, signal_dates, stock_pool_count):
         return
 
     eligible_mask = pd.Series(True, index=signal_df.index)
+    filter_names = []
     if EPS_FILTER_ENABLED:
         eligible_mask &= signal_df["eps"].isna() | (signal_df["eps"] >= MIN_EPS)
+        filter_names.append("EPS")
+    if PE_FILTER_ENABLED:
+        eligible_mask &= signal_df["pe"].isna() | ((signal_df["pe"] > 0) & (signal_df["pe"] <= MAX_PE))
+        filter_names.append("PE")
     if TOTAL_MV_FILTER_ENABLED:
         eligible_mask &= signal_df["total_mv"].isna() | (signal_df["total_mv"] > MIN_TOTAL_MV)
+        filter_names.append("总市值")
 
     filtered_stock_count = signal_df.loc[eligible_mask, "ts_code"].nunique()
+    filter_desc = "/".join(filter_names) if filter_names else "基础过滤"
     print(
         f"基础过滤前股票数（排除ST后）：{stock_pool_count}；"
-        f"基础过滤后股票数（信号窗口内至少1天通过EPS/总市值）：{filtered_stock_count}"
+        f"基础过滤后股票数（信号窗口内至少1天通过{filter_desc}）：{filtered_stock_count}"
     )
 
 
@@ -760,6 +915,7 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
     row = df.iloc[i]
     prev = df.iloc[i - 1]
 
+    # PE 下沉为基础过滤：只有拿到 PE 且超出合理区间时才淘汰，缺失值放行。
     if EPS_FILTER_ENABLED:
         if pd.notna(row["eps"]) and row["eps"] < MIN_EPS:
             add_stat(stats, "每股盈利不达标")
@@ -768,6 +924,11 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
     if TOTAL_MV_FILTER_ENABLED:
         if pd.notna(row["total_mv"]) and row["total_mv"] <= MIN_TOTAL_MV:
             add_stat(stats, "总市值不达标")
+            return False
+
+    if PE_FILTER_ENABLED:
+        if pd.notna(row["pe"]) and (row["pe"] <= 0 or row["pe"] > MAX_PE):
+            add_stat(stats, "市盈率不达标")
             return False
 
     if CONDITION_FLAGS["trend_above_ma20"] and pd.isna(row["ma20"]):
@@ -793,9 +954,6 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
         add_stat(stats, "基础面数据不足")
         return False
     if CONDITION_FLAGS["turnover_rate_range"] and pd.isna(row["turnover_rate"]):
-        add_stat(stats, "基础面数据不足")
-        return False
-    if CONDITION_FLAGS["pe_reasonable"] and pd.isna(row["pe"]):
         add_stat(stats, "基础面数据不足")
         return False
     if CONDITION_FLAGS["external_internal_ratio_high"] and pd.isna(row["external_internal_ratio"]):
@@ -874,11 +1032,13 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
             add_stat(stats, "换手率不达标")
             return False
 
-    # 10. 市盈率达标
-    if CONDITION_FLAGS["pe_reasonable"]:
-        if row["pe"] <= 0 or row["pe"] > MAX_PE:
-            add_stat(stats, "市盈率不达标")
+    # 10. 相对所属行业处于低估值区间
+    if CONDITION_FLAGS["industry_relative_valuation_low"]:
+        if not bool(row.get("industry_relative_valuation_low", False)):
+            add_stat(stats, row.get("industry_relative_valuation_reason", "行业估值不达标"))
             return False
+        if row.get("industry_relative_valuation_reason") == "行业样本不足，回退绝对PE":
+            add_stat(stats, "行业样本不足，回退绝对PE")
 
     # 11. 股东成分包含全国社保基金
     if CONDITION_FLAGS["social_security_holder"]:
@@ -922,15 +1082,22 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     if DATA_LOOKBACK_TRADE_DAYS < SIGNAL_DAYS:
         raise ValueError("DATA_LOOKBACK_TRADE_DAYS 不能小于 SIGNAL_DAYS")
 
+    moneyflow_needed = (
+        CONDITION_FLAGS["external_internal_ratio_high"]
+        or CONDITION_FLAGS["main_money_inflow_2days"]
+    )
     if end_date is None:
-        end_date = get_latest_completed_trade_date()
+        end_date = get_latest_completed_trade_date(require_moneyflow=moneyflow_needed)
+    elif moneyflow_needed:
+        end_date = resolve_trade_date_with_required_data(end_date, require_moneyflow=True)
 
-    enabled_conditions = [key for key, value in CONDITION_FLAGS.items() if value]
+    enabled_conditions = [key for key, value in CONDITION_FLAGS.items() if value and key != "pe_reasonable"]
     print(
         f"当前策略：{RUNTIME_CONFIG['strategy_name']}，"
         f"{RUNTIME_CONFIG.get('description', '')}"
     )
-    print(f"启用条件：{', '.join(enabled_conditions)}")
+    enabled_conditions_text = ", ".join(enabled_conditions) if enabled_conditions else "仅基础过滤"
+    print(f"启用条件：{enabled_conditions_text}")
     print(f"统计截止交易日：{end_date}")
 
     trade_dates = get_trade_dates(end_date, count=DATA_LOOKBACK_TRADE_DAYS)
@@ -970,11 +1137,8 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
             all_daily[col] = pd.NA
     if TOTAL_MV_FILTER_ENABLED and "total_mv" not in all_daily.columns:
         all_daily["total_mv"] = pd.NA
+    all_daily = add_industry_valuation_metrics(all_daily, stock_pool)
     print_basic_filter_stock_counts(all_daily, signal_dates, len(ts_codes))
-    moneyflow_needed = (
-        CONDITION_FLAGS["external_internal_ratio_high"]
-        or CONDITION_FLAGS["main_money_inflow_2days"]
-    )
     if moneyflow_needed:
         # 资金流条件依赖信号日前一日，用完整交易日窗口预计算可避免逐股逐日请求接口。
         all_moneyflow = load_all_moneyflow(trade_dates)
@@ -1024,6 +1188,8 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
                     add_stat(stats, "缺少前一交易日")
                     continue
 
+                signal_row = df.loc[i]
+
                 if not check_signal(
                     df,
                     i,
@@ -1043,7 +1209,17 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
                 results.append({
                     "ts_code": ts_code,
                     "name": name,
+                    "industry": signal_row.get("industry", ""),
                     "signal_date": signal_date,
+                    "pe": signal_row.get("pe"),
+                    "industry_stock_count": signal_row.get("industry_stock_count"),
+                    "industry_pe_mean": signal_row.get("industry_pe_mean"),
+                    "industry_pe_median": signal_row.get("industry_pe_median"),
+                    "industry_pe_percentile": signal_row.get("industry_pe_percentile"),
+                    "industry_pe_ratio_to_mean": signal_row.get("industry_pe_ratio_to_mean"),
+                    "industry_pe_ratio_to_median": signal_row.get("industry_pe_ratio_to_median"),
+                    "industry_pe_discount_to_mean_pct": signal_row.get("industry_pe_discount_to_mean_pct"),
+                    "industry_pe_discount_to_median_pct": signal_row.get("industry_pe_discount_to_median_pct"),
                     "base_close": base_close,
                     "base_high": base_high,
                     "base_low": base_low,
@@ -1077,7 +1253,17 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
                     results.append({
                         "ts_code": ts_code,
                         "name": name,
+                        "industry": signal_row.get("industry", ""),
                         "signal_date": signal_date,
+                        "pe": signal_row.get("pe"),
+                        "industry_stock_count": signal_row.get("industry_stock_count"),
+                        "industry_pe_mean": signal_row.get("industry_pe_mean"),
+                        "industry_pe_median": signal_row.get("industry_pe_median"),
+                        "industry_pe_percentile": signal_row.get("industry_pe_percentile"),
+                        "industry_pe_ratio_to_mean": signal_row.get("industry_pe_ratio_to_mean"),
+                        "industry_pe_ratio_to_median": signal_row.get("industry_pe_ratio_to_median"),
+                        "industry_pe_discount_to_mean_pct": signal_row.get("industry_pe_discount_to_mean_pct"),
+                        "industry_pe_discount_to_median_pct": signal_row.get("industry_pe_discount_to_median_pct"),
                         "base_close": base_close,
                         "base_high": base_high,
                         "base_low": base_low,
@@ -1129,7 +1315,7 @@ def get_enabled_condition_names():
     return [
         CONDITION_NAMES.get(key, key)
         for key, enabled in CONDITION_FLAGS.items()
-        if enabled
+        if enabled and key != "pe_reasonable"
     ]
 
 
@@ -1186,13 +1372,85 @@ def build_display_table(detail_df):
     return pd.DataFrame(rows, columns=columns)
 
 
-def save_display_excel(display_table, filename=RESULT_XLSX):
+def build_valuation_compare_table(detail_df):
+    compare_columns = [
+        "signal_date",
+        "ts_code",
+        "name",
+        "industry",
+        "pe",
+        "industry_stock_count",
+        "industry_pe_mean",
+        "industry_pe_median",
+        "industry_pe_percentile",
+        "industry_pe_ratio_to_mean",
+        "industry_pe_ratio_to_median",
+        "industry_pe_discount_to_mean_pct",
+        "industry_pe_discount_to_median_pct",
+    ]
+    if detail_df.empty or not set(compare_columns).issubset(detail_df.columns):
+        return pd.DataFrame()
+
+    base_df = detail_df[detail_df["forward_day"] == 0][compare_columns].copy()
+    if base_df.empty:
+        return pd.DataFrame()
+
+    base_df = base_df.sort_values(
+        by=["signal_date", "industry_pe_percentile", "industry_pe_ratio_to_median", "pe", "ts_code"],
+        ascending=[False, True, True, True, True]
+    ).reset_index(drop=True)
+    base_df["industry_pe_percentile"] = base_df["industry_pe_percentile"] * 100
+    base_df["industry_pe_ratio_to_mean"] = base_df["industry_pe_ratio_to_mean"] * 100
+    base_df["industry_pe_ratio_to_median"] = base_df["industry_pe_ratio_to_median"] * 100
+
+    rename_map = {
+        "signal_date": "信号日期",
+        "ts_code": "股票代码",
+        "name": "股票名称",
+        "industry": "行业板块",
+        "pe": "个股PE",
+        "industry_stock_count": "行业样本数",
+        "industry_pe_mean": "行业平均PE",
+        "industry_pe_median": "行业中位PE",
+        "industry_pe_percentile": "行业PE分位(%)",
+        "industry_pe_ratio_to_mean": "个股/行业平均PE(%)",
+        "industry_pe_ratio_to_median": "个股/行业中位PE(%)",
+        "industry_pe_discount_to_mean_pct": "较行业平均折价(%)",
+        "industry_pe_discount_to_median_pct": "较行业中位折价(%)",
+    }
+    compare_df = base_df.rename(columns=rename_map)
+    numeric_columns = [col for col in compare_df.columns if col not in ["信号日期", "股票代码", "股票名称", "行业板块"]]
+    compare_df[numeric_columns] = compare_df[numeric_columns].apply(pd.to_numeric, errors="coerce").round(2)
+    return compare_df
+
+
+def fill_dataframe_sheet(worksheet, dataframe):
+    if dataframe is None or dataframe.empty:
+        worksheet["A1"] = "无数据"
+        return
+
+    for col_index, column_name in enumerate(dataframe.columns, start=1):
+        cell = worksheet.cell(row=1, column=col_index, value=column_name)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        worksheet.column_dimensions[get_column_letter(col_index)].width = max(12, len(str(column_name)) + 4)
+
+    for row_index, row in enumerate(dataframe.itertuples(index=False), start=2):
+        for col_index, value in enumerate(row, start=1):
+            cell = worksheet.cell(row=row_index, column=col_index, value=value)
+            cell.alignment = Alignment(vertical="center")
+
+    worksheet.freeze_panes = "A2"
+
+
+def save_display_excel(display_table, valuation_compare_table=None, filename=RESULT_XLSX):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "策略筛选"
     summary_sheet = workbook.create_sheet("策略说明")
+    valuation_sheet = workbook.create_sheet("估值对比")
     red_font = Font(color="FF0000")
     green_font = Font(color="008000")
 
@@ -1203,10 +1461,17 @@ def save_display_excel(display_table, filename=RESULT_XLSX):
     summary_sheet["B2"] = RUNTIME_CONFIG.get("description", "")
     summary_sheet["A3"] = "基础过滤"
     eps_filter_text = f"EPS >= {MIN_EPS}" if EPS_FILTER_ENABLED else "EPS不过滤"
+    pe_filter_text = f"PE 在 (0, {MAX_PE}] 且空值放行" if PE_FILTER_ENABLED else "PE不过滤"
     total_mv_filter_text = f"总市值 > {MIN_TOTAL_MV / 10000:.0f}亿" if TOTAL_MV_FILTER_ENABLED else "总市值不过滤"
-    summary_sheet["B3"] = f"排除ST：{RUNTIME_CONFIG['exclude_st_stocks']}；{eps_filter_text}；{total_mv_filter_text}"
+    summary_sheet["B3"] = f"排除ST：{RUNTIME_CONFIG['exclude_st_stocks']}；{eps_filter_text}；{pe_filter_text}；{total_mv_filter_text}"
     summary_sheet["A4"] = "启用条件"
-    summary_sheet["B4"] = "、".join(enabled_condition_names)
+    summary_sheet["B4"] = "、".join(enabled_condition_names) if enabled_condition_names else "仅基础过滤"
+    summary_sheet["A5"] = "行业估值阈值"
+    summary_sheet["B5"] = (
+        f"行业样本数 >= {INDUSTRY_PE_MIN_SAMPLE_COUNT}；"
+        f"行业PE分位 <= {INDUSTRY_PE_MAX_PERCENTILE * 100:.0f}%；"
+        f"个股/行业中位PE <= {INDUSTRY_PE_MAX_RATIO_TO_MEDIAN * 100:.0f}%"
+    )
     summary_sheet["A6"] = "启用条件明细"
     for row_index, condition_name in enumerate(enabled_condition_names, start=7):
         summary_sheet.cell(row=row_index, column=1, value=condition_name)
@@ -1249,6 +1514,7 @@ def save_display_excel(display_table, filename=RESULT_XLSX):
     for col_index in range(4, column_count + 1):
         worksheet.column_dimensions[get_column_letter(col_index)].width = 18
 
+    fill_dataframe_sheet(valuation_sheet, valuation_compare_table)
     workbook.save(filename)
     return True
 
@@ -1259,7 +1525,8 @@ def save_result_tables(detail_df):
         return None
 
     display_table = build_display_table(detail_df)
-    saved_xlsx = save_display_excel(display_table)
+    valuation_compare_table = build_valuation_compare_table(detail_df)
+    saved_xlsx = save_display_excel(display_table, valuation_compare_table=valuation_compare_table)
 
     if saved_xlsx:
         print(f"策略筛选横向展示表：{RESULT_XLSX}")
