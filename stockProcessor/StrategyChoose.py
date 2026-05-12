@@ -68,6 +68,7 @@ MIN_VOLUME_RATIO = RUNTIME_CONFIG["min_volume_ratio"]
 MIN_EXTERNAL_INTERNAL_RATIO = RUNTIME_CONFIG["min_external_internal_ratio"]
 MIN_TURNOVER_RATE = RUNTIME_CONFIG["min_turnover_rate"]
 MAX_TURNOVER_RATE = RUNTIME_CONFIG["max_turnover_rate"]
+MIN_PE = 0.0
 MAX_PE = normalize_optional_number(RUNTIME_CONFIG["max_pe"])
 PE_FILTER_ENABLED = bool(CONDITION_FLAGS.get("pe_reasonable", False)) and MAX_PE is not None
 INDUSTRY_PE_MIN_SAMPLE_COUNT = int(RUNTIME_CONFIG.get("industry_pe_min_sample_count", 5))
@@ -764,6 +765,102 @@ def add_stat(stats, key):
         stats[key] = stats.get(key, 0) + 1
 
 
+def ensure_numeric_column(df, col):
+    if col not in df.columns:
+        df[col] = pd.NA
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+
+def get_basic_filter_pe_series(df, prefer_pe_ttm=False):
+    ensure_numeric_column(df, "pe")
+    if prefer_pe_ttm:
+        ensure_numeric_column(df, "pe_ttm")
+        return df["pe_ttm"].where(df["pe_ttm"] > 0, df["pe"])
+    return df["pe"]
+
+
+def apply_basic_filters(
+    df,
+    *,
+    stock_name_map=None,
+    exclude_st=False,
+    exclude_bj=False,
+    prefer_pe_ttm=False,
+    estimate_eps_when_missing=False,
+):
+    """
+    统一基础过滤入口：
+    - 股票池阶段：可直接处理 ST / BJ；
+    - 信号候选阶段：在 ST / BJ 之外继续处理 EPS / PE / 总市值。
+    """
+    if df.empty:
+        summary = {
+            "filter_names": [],
+            "before_stock_count": 0,
+            "after_stock_count": 0,
+            "before_row_count": 0,
+            "after_row_count": 0,
+        }
+        return df.copy(), summary
+
+    filtered_df = df.copy()
+    if stock_name_map is not None and "name" not in filtered_df.columns and "ts_code" in filtered_df.columns:
+        filtered_df["name"] = filtered_df["ts_code"].map(stock_name_map)
+
+    filter_names = []
+    eligible_mask = pd.Series(True, index=filtered_df.index, dtype=bool)
+
+    if exclude_st and "name" in filtered_df.columns:
+        eligible_mask &= ~filtered_df["name"].astype(str).str.contains("ST", na=False)
+        filter_names.append("ST")
+
+    if exclude_bj and "ts_code" in filtered_df.columns:
+        eligible_mask &= ~filtered_df["ts_code"].astype(str).str.endswith(".BJ")
+        filter_names.append("BJ")
+
+    has_basic_price_context = "close" in filtered_df.columns
+    if has_basic_price_context:
+        ensure_numeric_column(filtered_df, "close")
+
+    if EPS_FILTER_ENABLED and has_basic_price_context:
+        ensure_numeric_column(filtered_df, "eps")
+        if estimate_eps_when_missing:
+            pe_ref = get_basic_filter_pe_series(filtered_df, prefer_pe_ttm=prefer_pe_ttm)
+            eps_estimated = filtered_df["close"] / pe_ref.where(pe_ref > 0)
+            filtered_df["eps"] = filtered_df["eps"].where(filtered_df["eps"].notna(), eps_estimated)
+        eligible_mask &= filtered_df["eps"].isna() | (filtered_df["eps"] >= MIN_EPS)
+        filter_names.append("EPS")
+
+    if PE_FILTER_ENABLED and "pe" in filtered_df.columns:
+        pe_for_filter = get_basic_filter_pe_series(filtered_df, prefer_pe_ttm=prefer_pe_ttm)
+        eligible_mask &= pe_for_filter.isna() | ((pe_for_filter > MIN_PE) & (pe_for_filter <= MAX_PE))
+        filter_names.append("PE")
+
+    if TOTAL_MV_FILTER_ENABLED and "total_mv" in filtered_df.columns:
+        ensure_numeric_column(filtered_df, "total_mv")
+        eligible_mask &= filtered_df["total_mv"].isna() | (filtered_df["total_mv"] > MIN_TOTAL_MV)
+        filter_names.append("总市值")
+
+    result_df = filtered_df.loc[eligible_mask].copy()
+    summary = {
+        "filter_names": filter_names,
+        "before_stock_count": filtered_df["ts_code"].nunique() if "ts_code" in filtered_df.columns else len(filtered_df),
+        "after_stock_count": result_df["ts_code"].nunique() if "ts_code" in result_df.columns else len(result_df),
+        "before_row_count": len(filtered_df),
+        "after_row_count": len(result_df),
+    }
+    return result_df, summary
+
+
+def print_basic_filter_summary(summary, context_label):
+    filter_desc = " + ".join(summary["filter_names"]) if summary["filter_names"] else "无"
+    print(
+        f"{context_label}基础过滤完成（{filter_desc}）："
+        f"股票数 {summary['before_stock_count']} -> {summary['after_stock_count']}；"
+        f"记录数 {summary['before_row_count']} -> {summary['after_row_count']}"
+    )
+
+
 def build_industry_relative_valuation_result(
     df,
     pe_column="pe",
@@ -885,51 +982,9 @@ def add_industry_valuation_metrics(all_daily, stock_pool):
     return merged
 
 
-def print_basic_filter_stock_counts(all_daily, signal_dates, stock_pool_count):
-    signal_df = all_daily[all_daily["trade_date"].isin(set(signal_dates))].copy()
-    if signal_df.empty:
-        print(f"基础过滤前股票数（排除ST后）：{stock_pool_count}；基础过滤后股票数：0")
-        return
-
-    eligible_mask = pd.Series(True, index=signal_df.index)
-    filter_names = []
-    if EPS_FILTER_ENABLED:
-        eligible_mask &= signal_df["eps"].isna() | (signal_df["eps"] >= MIN_EPS)
-        filter_names.append("EPS")
-    if PE_FILTER_ENABLED:
-        eligible_mask &= signal_df["pe"].isna() | ((signal_df["pe"] > 0) & (signal_df["pe"] <= MAX_PE))
-        filter_names.append("PE")
-    if TOTAL_MV_FILTER_ENABLED:
-        eligible_mask &= signal_df["total_mv"].isna() | (signal_df["total_mv"] > MIN_TOTAL_MV)
-        filter_names.append("总市值")
-
-    filtered_stock_count = signal_df.loc[eligible_mask, "ts_code"].nunique()
-    filter_desc = "/".join(filter_names) if filter_names else "基础过滤"
-    print(
-        f"基础过滤前股票数（排除ST后）：{stock_pool_count}；"
-        f"基础过滤后股票数（信号窗口内至少1天通过{filter_desc}）：{filtered_stock_count}"
-    )
-
-
 def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref, shareholder_cache_ref, stats=None):
     row = df.iloc[i]
     prev = df.iloc[i - 1]
-
-    # PE 下沉为基础过滤：只有拿到 PE 且超出合理区间时才淘汰，缺失值放行。
-    if EPS_FILTER_ENABLED:
-        if pd.notna(row["eps"]) and row["eps"] < MIN_EPS:
-            add_stat(stats, "每股盈利不达标")
-            return False
-
-    if TOTAL_MV_FILTER_ENABLED:
-        if pd.notna(row["total_mv"]) and row["total_mv"] <= MIN_TOTAL_MV:
-            add_stat(stats, "总市值不达标")
-            return False
-
-    if PE_FILTER_ENABLED:
-        if pd.notna(row["pe"]) and (row["pe"] <= 0 or row["pe"] > MAX_PE):
-            add_stat(stats, "市盈率不达标")
-            return False
 
     if CONDITION_FLAGS["trend_above_ma20"] and pd.isna(row["ma20"]):
         add_stat(stats, "指标数据不足")
@@ -1066,13 +1121,18 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
 # ======================
 # 主逻辑
 # ======================
-def load_stock_pool(ts_codes=None):
+def load_stock_pool(ts_codes=None, exclude_st=None, exclude_bj=False):
     stock_pool = basic_api.stock_basic()
-    if RUNTIME_CONFIG["exclude_st_stocks"]:
-        stock_pool = stock_pool[~stock_pool["name"].astype(str).str.contains("ST", na=False)]
     if ts_codes:
         stock_pool = stock_pool[stock_pool["ts_code"].isin(ts_codes)]
-    return stock_pool
+    if exclude_st is None:
+        exclude_st = RUNTIME_CONFIG["exclude_st_stocks"]
+    stock_pool, _ = apply_basic_filters(
+        stock_pool,
+        exclude_st=exclude_st,
+        exclude_bj=exclude_bj,
+    )
+    return stock_pool.reset_index(drop=True)
 
 
 def choose_strategy(stock_pool=None, end_date=END_DATE):
@@ -1138,7 +1198,20 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
     if TOTAL_MV_FILTER_ENABLED and "total_mv" not in all_daily.columns:
         all_daily["total_mv"] = pd.NA
     all_daily = add_industry_valuation_metrics(all_daily, stock_pool)
-    print_basic_filter_stock_counts(all_daily, signal_dates, len(ts_codes))
+    signal_df = all_daily[all_daily["trade_date"].astype(str).isin(set(signal_dates))].copy()
+    filtered_signal_df, basic_filter_summary = apply_basic_filters(
+        signal_df,
+        stock_name_map=stock_info,
+        exclude_st=RUNTIME_CONFIG["exclude_st_stocks"],
+        prefer_pe_ttm=False,
+    )
+    print_basic_filter_summary(basic_filter_summary, "筛选信号窗口")
+    eligible_signal_keys = set(zip(
+        filtered_signal_df["ts_code"].astype(str),
+        filtered_signal_df["trade_date"].astype(str),
+    ))
+    if not eligible_signal_keys:
+        return pd.DataFrame()
     if moneyflow_needed:
         # 资金流条件依赖信号日前一日，用完整交易日窗口预计算可避免逐股逐日请求接口。
         all_moneyflow = load_all_moneyflow(trade_dates)
@@ -1181,6 +1254,10 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
                 matched = df[df["trade_date"] == signal_date]
                 if matched.empty:
                     add_stat(stats, "筛选日无日线")
+                    continue
+
+                if (str(ts_code), str(signal_date)) not in eligible_signal_keys:
+                    add_stat(stats, "基础过滤未通过")
                     continue
 
                 i = matched.index[0]

@@ -77,7 +77,7 @@ DEFAULT_CONFIG = {
         "volume_ratio_high": True,
         "external_internal_ratio_high": False,
         "turnover_rate_range": True,
-        "pe_reasonable": True,
+        "pe_reasonable": False,
         "industry_relative_valuation_low": False,
         "social_security_holder": False,
         "prev_year_high_dividend": False,
