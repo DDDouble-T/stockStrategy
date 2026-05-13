@@ -22,8 +22,10 @@ DEFAULT_CONFIG = {
     "near_ma_threshold": 0.015,
     # 突破前高时回看多少个交易日的最高价作为压力位。
     "recent_high_lookback_days": 20,
-    # 上一年度每 10 股税前现金分红下限，单位与 TuShare dividend.cash_div_tax 保持一致。
-    "prev_year_min_cash_div_tax": 1.0,
+    # TTM 股息率下限，单位为百分比，2.0 表示 2%。
+    "min_dv_ttm": 2.0,
+    # TTM 股息率上限，单位为百分比，6.0 表示 6%。
+    "max_dv_ttm": 6.0,
     # 是否启用每股收益 EPS 基础过滤；关闭后不拉取 EPS，也不按 EPS 过滤。
     "enable_eps_filter": True,
     # 每股收益 EPS 基础过滤下限；仅在 enable_eps_filter 为 True 且 eps 有值时生效。
@@ -65,7 +67,7 @@ DEFAULT_CONFIG = {
     # pe_reasonable: 启用市盈率基础过滤，要求 PE 在合理区间 0-80；pe 为空时放行
     # industry_relative_valuation_low: 相对所属行业处于低估值区间
     # social_security_holder: 股东成分包含全国社保基金
-    # prev_year_high_dividend: 上一年度现金分红较高，10股税前大于1
+    # prev_year_high_dividend: TTM 股息率在设定区间内
     # main_money_inflow_2days: 主力资金连续流入2天
     "conditions": {
         "trend_above_ma20": False,
@@ -91,7 +93,7 @@ STRATEGY_PRESETS = {
         "description": "强化版 ShareChoose，基础过滤每股盈利和 ST，增加换手量比、外盘内盘比、换手率、市盈率、社保基金股东成分。",
     },
     "balanced": {
-        "description": "默认均衡策略，保留当前技术面、分红和资金流条件。",
+        "description": "默认均衡策略，保留当前技术面和资金流条件。",
         "conditions": {
             "volume_ratio_high": False,
             "external_internal_ratio_high": False,
@@ -114,15 +116,17 @@ STRATEGY_PRESETS = {
         },
     },
     "dividend_quality": {
-        "description": "偏分红质量，保留趋势条件，提高上一年度分红门槛。",
+        "description": "偏股息率质量，保留趋势条件，要求 TTM 股息率在 2%-6% 区间。",
         "signal_days": 15,
-        "prev_year_min_cash_div_tax": 2.0,
+        "min_dv_ttm": 2.0,
+        "max_dv_ttm": 6.0,
         "conditions": {
             "volume_ratio_high": False,
             "external_internal_ratio_high": False,
             "turnover_rate_range": False,
             "pe_reasonable": True,
             "social_security_holder": True,
+            "prev_year_high_dividend": True,
             "main_money_inflow_2days": False,
         },
     },

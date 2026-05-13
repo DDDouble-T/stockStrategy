@@ -34,6 +34,7 @@ import pandas as pd
 
 # 复用你现有 StrategyChoose.py 里的 TuShare 配置、日线缓存、指标计算、股票池等逻辑
 import StrategyChoose as sc
+import strategy_choose_config
 from stockProcessor.download.constants import data_path, result_path
 
 
@@ -96,6 +97,16 @@ MAX_PE = getattr(sc, "MAX_PE", 80.0)
 # 内外盘/主动买卖强度：用大单+特大单买卖量近似，避免全量买卖天然接近平衡。
 MIN_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MIN_EXTERNAL_INTERNAL_RATIO", 1.05)
 MAX_EXTERNAL_INTERNAL_RATIO = getattr(sc, "MAX_EXTERNAL_INTERNAL_RATIO", 2.50)
+MIN_DV_TTM = getattr(
+    sc,
+    "RUNTIME_CONFIG",
+    strategy_choose_config.DEFAULT_CONFIG,
+).get("min_dv_ttm", 2.0)
+MAX_DV_TTM = getattr(
+    sc,
+    "RUNTIME_CONFIG",
+    strategy_choose_config.DEFAULT_CONFIG,
+).get("max_dv_ttm", 6.0)
 
 # ----------------------
 # 筛选密度惩罚
@@ -127,8 +138,7 @@ BUCKET_LABELS = ["<=-10%", "-10~-5%", "-5~-3%", "-3~0%", "0~3%", "3~5%", "5~10%"
 # ======================
 
 # EPS、PE 和 ST 属于基础过滤：先排除不合格样本，不参与策略条件组合评分。
-# 这里默认不加入 prev_year_high_dividend，因为你这次描述的策略没有包含分红条件。
-# 分红偏基本面，和 3/10/20/30 个交易日的短中线表现不一定强相关。
+# 股息率条件直接复用 choose 的 daily_basic 口径，避免额外分红缓存造成口径分叉。
 CONDITION_KEYS = [
     "bullish_ma_alignment",          # 5日 > 10日 > 20日
     "volume_rule",                   # 上涨放量或回调缩量
@@ -141,6 +151,7 @@ CONDITION_KEYS = [
     "industry_relative_valuation_low",  # 行业样本不足回退绝对PE，否则要求相对行业低估
     "social_security_holder",        # 股东成分包含全国社保基金（如果 StrategyChoose 支持）
     "main_money_inflow_2days",       # 主力资金连续流入2天
+    "prev_year_high_dividend"
 ]
 
 CONDITION_NAME = {
@@ -156,6 +167,7 @@ CONDITION_NAME = {
     "industry_relative_valuation_low": "相对行业低估",
     "social_security_holder": "含全国社保基金",
     "main_money_inflow_2days": "主力连续流入2天",
+    "prev_year_high_dividend": "TTM股息率达标"
 }
 
 
@@ -354,7 +366,7 @@ def build_condition_base_df(
             name = stock_info.get(ts_code, "")
 
             # 确保 basic 字段存在并为数值。
-            basic_columns = ["volume_ratio", "turnover_rate", "pe", "pe_ttm"]
+            basic_columns = ["volume_ratio", "turnover_rate", "pe", "pe_ttm", "dv_ttm"]
             for col in basic_columns:
                 ensure_numeric_column(df, col)
 
@@ -412,6 +424,10 @@ def build_condition_base_df(
                 main_inflow_map.get((ts_code, trade_date), False)
                 for trade_date in df["trade_date"].astype(str)
             ]
+            df["prev_year_high_dividend"] = (
+                (df["dv_ttm"] >= MIN_DV_TTM)
+                & (df["dv_ttm"] <= MAX_DV_TTM)
+            )
 
             # NaN 条件统一按 False 处理
             for key in CONDITION_KEYS:
@@ -924,6 +940,7 @@ def main():
     print(f"交易日窗口：{trade_dates[0]} ~ {trade_dates[-1]}，共 {len(trade_dates)} 个交易日")
     print(f"候选信号日：{signal_dates[0]} ~ {signal_dates[-1]}，共 {len(signal_dates)} 个交易日")
     print(f"观察周期：{FORWARD_DAYS} 个交易日")
+    print(f"评分条件集合：{', '.join(CONDITION_KEYS)}")
 
     stock_pool = load_score_stock_pool()
     stock_info = {row["ts_code"]: row["name"] for _, row in stock_pool.iterrows()}
@@ -986,6 +1003,10 @@ def main():
         "df": load_shareholder_cache_safe(),
         "dirty": False,
     }
+    if "prev_year_high_dividend" in CONDITION_KEYS:
+        print(
+            f"评分TTM股息率筛选区间：{MIN_DV_TTM}% ~ {MAX_DV_TTM}%"
+        )
 
     base_df = build_condition_base_df(
         all_daily,
@@ -1026,6 +1047,8 @@ def main():
         {"key": "signal_date_start", "value": signal_dates[0]},
         {"key": "signal_date_end", "value": signal_dates[-1]},
         {"key": "forward_days", "value": str(FORWARD_DAYS)},
+        {"key": "condition_keys", "value": ", ".join(CONDITION_KEYS)},
+        {"key": "prev_year_min_cash_div_tax", "value": PREV_YEAR_MIN_CASH_DIV_TAX},
         {"key": "return_weight_mode", "value": "收益分权重已上调，排名更偏向真实收益兑现"},
         {"key": "stock_count_after_st_bj_before_eps_total_mv", "value": len(ts_codes)},
         {"key": "stock_count_after_eps_total_mv_st_bj", "value": candidate_stock_count},

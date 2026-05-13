@@ -9,7 +9,6 @@ from openpyxl.utils import get_column_letter
 from module.basic import basic_api
 from module.config import tushare_config
 from stockProcessor import eps_download as eps_downloader
-from stockProcessor import prev_year_high_dividend_download as dividend_downloader
 from stockProcessor.download.constants import data_path, score_result_path
 import strategy_choose_config
 
@@ -46,7 +45,8 @@ DAILY_CACHE_CSV = data_path("strategy_daily_cache.csv")
 BASIC_CACHE_CSV = data_path("strategy_basic_cache.csv")
 SHAREHOLDER_CACHE_CSV = data_path("strategy_shareholder_cache.csv")
 MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
-PREV_YEAR_MIN_CASH_DIV_TAX = RUNTIME_CONFIG["prev_year_min_cash_div_tax"]
+MIN_DV_TTM = RUNTIME_CONFIG.get("min_dv_ttm")
+MAX_DV_TTM = RUNTIME_CONFIG.get("max_dv_ttm")
 RESULT_XLSX = score_result_path("strategy_choose_result.xlsx")
 CONDITION_FLAGS = RUNTIME_CONFIG["conditions"]
 RSI_MAX = RUNTIME_CONFIG["rsi_max"]
@@ -88,7 +88,7 @@ CONDITION_NAMES = {
     "pe_reasonable": "市盈率合理",
     "industry_relative_valuation_low": "相对行业估值偏低",
     "social_security_holder": "股东成分包含全国社保基金",
-    "prev_year_high_dividend": "上一年度现金分红较高",
+    "prev_year_high_dividend": "TTM股息率在区间内",
     "main_money_inflow_2days": "主力资金连续流入2天",
 }
 
@@ -416,7 +416,7 @@ def load_basic_cache():
     drop_columns = [col for col in ["total_mv", "eps"] if col in df.columns]
     if drop_columns:
         df = df.drop(columns=drop_columns)
-    numeric_columns = ["volume_ratio", "turnover_rate", "pe"]
+    numeric_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
     for col in numeric_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -430,7 +430,7 @@ def save_basic_cache(df):
 
 def fetch_daily_basic_by_trade_date(trade_date):
     pro = pro_api()
-    fields = "ts_code,trade_date,pe,pe_ttm,volume_ratio,turnover_rate"
+    fields = "ts_code,trade_date,pe,pe_ttm,volume_ratio,turnover_rate,dv_ttm"
     return pro.daily_basic(
         trade_date=trade_date,
         fields=fields
@@ -470,7 +470,7 @@ def load_latest_total_mv(ts_codes, trade_date):
 
 
 def merge_basic_frames(daily_basic_df, trade_date):
-    daily_basic_columns = ["ts_code", "trade_date", "pe", "pe_ttm", "volume_ratio", "turnover_rate"]
+    daily_basic_columns = ["ts_code", "trade_date", "pe", "pe_ttm", "volume_ratio", "turnover_rate", "dv_ttm"]
     if daily_basic_df is None or daily_basic_df.empty:
         daily_basic_df = pd.DataFrame(columns=daily_basic_columns)
 
@@ -484,7 +484,7 @@ def merge_basic_frames(daily_basic_df, trade_date):
     if "pe_ttm" in merged.columns:
         merged["pe"] = merged["pe_ttm"].where(merged["pe_ttm"].notna(), merged.get("pe"))
 
-    columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
+    columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"]
     for col in columns:
         if col not in merged.columns:
             merged[col] = pd.NA
@@ -494,7 +494,7 @@ def merge_basic_frames(daily_basic_df, trade_date):
 
 def load_all_basic(ts_codes, trade_dates, daily_df=None):
     cache_df = load_basic_cache()
-    required_columns = {"ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"}
+    required_columns = {"ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"}
     cache_has_required_columns = required_columns.issubset(set(cache_df.columns))
     valid_cached_dates = set()
     invalid_cached_dates = []
@@ -513,7 +513,7 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
             if date_df.empty:
                 continue
 
-            daily_basic_columns = ["volume_ratio", "turnover_rate", "pe"]
+            daily_basic_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
             daily_basic_ready = date_df[daily_basic_columns].notna().any(axis=0).all()
             expected_count = expected_counts.get(trade_date)
             coverage_ready = True
@@ -548,7 +548,7 @@ def load_all_basic(ts_codes, trade_dates, daily_df=None):
             print(f"已补齐基础面数据：{trade_date}")
 
     if cache_df.empty:
-        columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
+        columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"]
         if EPS_FILTER_ENABLED:
             columns.insert(2, "eps")
         return pd.DataFrame(columns=columns)
@@ -655,24 +655,14 @@ def get_social_security_holder_flag(ts_code, shareholder_cache_ref):
     return holder_flag
 
 
-def load_dividend_cache():
-    return dividend_downloader.load_dividend_cache()
-
-
-def save_dividend_cache(df):
-    dividend_downloader.save_dividend_cache(df)
-
-
-def fetch_prev_year_cash_div_tax(ts_code, dividend_year):
-    return dividend_downloader.fetch_prev_year_cash_div_tax(ts_code, dividend_year)
-
-
-def get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref):
-    return dividend_downloader.get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref)
-
-
-def is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref):
-    return dividend_downloader.is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref)
+def is_ttm_dividend_yield_in_range(dv_ttm):
+    if pd.isna(dv_ttm):
+        return False
+    if MIN_DV_TTM is not None and dv_ttm < MIN_DV_TTM:
+        return False
+    if MAX_DV_TTM is not None and dv_ttm > MAX_DV_TTM:
+        return False
+    return True
 
 
 def load_all_daily(ts_codes, trade_dates):
@@ -940,7 +930,14 @@ def add_industry_valuation_metrics(all_daily, stock_pool):
     return merged
 
 
-def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref, shareholder_cache_ref, stats=None):
+def check_signal(
+    df,
+    i,
+    ts_code,
+    trade_dates,
+    shareholder_cache_ref,
+    stats=None
+):
     row = df.iloc[i]
     prev = df.iloc[i - 1]
 
@@ -967,6 +964,9 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
         add_stat(stats, "基础面数据不足")
         return False
     if CONDITION_FLAGS["turnover_rate_range"] and pd.isna(row["turnover_rate"]):
+        add_stat(stats, "基础面数据不足")
+        return False
+    if CONDITION_FLAGS["prev_year_high_dividend"] and pd.isna(row.get("dv_ttm", pd.NA)):
         add_stat(stats, "基础面数据不足")
         return False
     if CONDITION_FLAGS["external_internal_ratio_high"] and pd.isna(row["external_internal_ratio"]):
@@ -1059,10 +1059,10 @@ def check_signal(df, i, ts_code, trade_dates, dividend_year, dividend_cache_ref,
             add_stat(stats, "股东成分不含全国社保基金")
             return False
 
-    # 12. 上一年度现金分红较高
+    # 12. TTM 股息率在目标区间
     if CONDITION_FLAGS["prev_year_high_dividend"]:
-        if not is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref):
-            add_stat(stats, "上一年度分红不高")
+        if not is_ttm_dividend_yield_in_range(row.get("dv_ttm", pd.NA)):
+            add_stat(stats, "TTM股息率不在目标区间")
             return False
 
     # 13. 主力资金连续流入2天
@@ -1147,7 +1147,7 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
             on=["ts_code", "trade_date"],
             how="left"
         )
-    required_basic_columns = ["volume_ratio", "turnover_rate", "pe"]
+    required_basic_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
     if EPS_FILTER_ENABLED:
         required_basic_columns.append("eps")
     for col in required_basic_columns:
@@ -1185,32 +1185,13 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
 
     results = []
     stats = {}
-    dividend_year = int(end_date[:4]) - 1
-    dividend_cache_df = pd.DataFrame()
-    if CONDITION_FLAGS["prev_year_high_dividend"]:
-        candidate_ts_codes = (
-            filtered_signal_df["ts_code"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-        dividend_cache_df = dividend_downloader.download_prev_year_high_dividend_for_ts_codes(
-            candidate_ts_codes,
-            dividend_year
-        )
-    dividend_cache_ref = {
-        "df": dividend_cache_df if CONDITION_FLAGS["prev_year_high_dividend"] else pd.DataFrame(),
-        "dirty": False
-    }
     shareholder_cache_ref = {
         "df": load_shareholder_cache() if CONDITION_FLAGS["social_security_holder"] else pd.DataFrame(),
         "dirty": False
     }
     if CONDITION_FLAGS["prev_year_high_dividend"]:
         print(
-            f"分红筛选年度：{dividend_year}，"
-            f"每10股税前现金分红下限：{PREV_YEAR_MIN_CASH_DIV_TAX}"
+            f"TTM股息率筛选区间：{MIN_DV_TTM}% ~ {MAX_DV_TTM}%"
         )
 
     for ts_code, raw_df in all_daily.groupby("ts_code"):
@@ -1243,8 +1224,6 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
                     i,
                     ts_code,
                     trade_dates,
-                    dividend_year,
-                    dividend_cache_ref,
                     shareholder_cache_ref,
                     stats
                 ):
@@ -1334,8 +1313,6 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
         except Exception as e:
             print(f"{ts_code} error: {e}")
 
-    if dividend_cache_ref["dirty"]:
-        save_dividend_cache(dividend_cache_ref["df"])
     if shareholder_cache_ref["dirty"]:
         save_shareholder_cache(shareholder_cache_ref["df"])
 

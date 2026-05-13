@@ -1,5 +1,4 @@
 import os
-from copy import deepcopy
 
 import pandas as pd
 import tushare as ts
@@ -7,7 +6,6 @@ import tushare as ts
 from module.config import tushare_config
 from stockProcessor import eps_download as eps_downloader
 from stockProcessor.download.constants import data_path
-import strategy_choose_config
 
 
 # ======================
@@ -22,19 +20,7 @@ END_DATE = None
 # None / ""：从基础面缓存中的最早 trade_date 开始更新。
 # 例如 "20250101"：从指定日期开始更新到 END_DATE 或最近已完成交易日。
 UPDATE_START_DATE = None
-
-
-def load_strategy_runtime_config():
-    # 下载脚本只负责构建稳定缓存，不应随着 ACTIVE_STRATEGY 切换而改变下载口径。
-    # 这里固定基于默认配置，避免选股 preset 影响基础数据准备。
-    config = deepcopy(strategy_choose_config.DEFAULT_CONFIG)
-    config["strategy_name"] = "default_download"
-    return config
-
-
-RUNTIME_CONFIG = load_strategy_runtime_config()
 DIVIDEND_CACHE_CSV = data_path("strategy_dividend_cache.csv")
-PREV_YEAR_MIN_CASH_DIV_TAX = float(RUNTIME_CONFIG["prev_year_min_cash_div_tax"])
 KEY_COLUMNS = ["ts_code", "dividend_year"]
 
 
@@ -132,6 +118,46 @@ def resolve_prev_dividend_year(trade_dates):
 
     latest_trade_date = max(str(item) for item in trade_dates)
     return str(int(latest_trade_date[:4]) - 1)
+
+
+def resolve_prev_dividend_year_for_trade_date(trade_date):
+    trade_date = str(trade_date).strip()
+    if len(trade_date) < 4 or not trade_date[:4].isdigit():
+        raise ValueError(f"trade_date 格式非法，无法推导上一年度分红年份: {trade_date}")
+    return str(int(trade_date[:4]) - 1)
+
+
+def normalize_signal_records_df(signal_df, trade_date_col="trade_date"):
+    if signal_df is None:
+        return pd.DataFrame(columns=["ts_code", trade_date_col])
+
+    if isinstance(signal_df, pd.DataFrame):
+        df = signal_df.copy()
+    else:
+        df = pd.DataFrame(signal_df)
+
+    required_columns = ["ts_code", trade_date_col]
+    for col in required_columns:
+        if col not in df.columns:
+            return pd.DataFrame(columns=required_columns)
+
+    df = df[required_columns].copy()
+    df = df[df["ts_code"].notna() & df[trade_date_col].notna()]
+    df["ts_code"] = df["ts_code"].astype(str).str.strip()
+    df[trade_date_col] = df[trade_date_col].astype(str).str.strip()
+    df = df[(df["ts_code"] != "") & (df[trade_date_col] != "")]
+    df = df.drop_duplicates(subset=required_columns, keep="last").reset_index(drop=True)
+    return df
+
+
+def build_required_pairs_from_signal_records(signal_df, trade_date_col="trade_date"):
+    records_df = normalize_signal_records_df(signal_df, trade_date_col=trade_date_col)
+    if records_df.empty:
+        return pd.DataFrame(columns=KEY_COLUMNS)
+
+    working_df = records_df.copy()
+    working_df["dividend_year"] = working_df[trade_date_col].apply(resolve_prev_dividend_year_for_trade_date)
+    return normalize_required_pairs_df(working_df[["ts_code", "dividend_year"]])
 
 
 def get_required_dividend_pairs_from_basic_cache(trade_dates=None, strict=False, dividend_year=None):
@@ -335,6 +361,13 @@ def download_prev_year_high_dividend_for_ts_codes(ts_codes, dividend_year):
     return download_prev_year_high_dividend(required_pairs=required_pairs_df)
 
 
+def load_dividend_cache_for_signal_records(signal_df, trade_date_col="trade_date"):
+    required_pairs_df = build_required_pairs_from_signal_records(signal_df, trade_date_col=trade_date_col)
+    if required_pairs_df.empty:
+        return pd.DataFrame(columns=["ts_code", "dividend_year", "cash_div_tax"])
+    return download_prev_year_high_dividend(required_pairs=required_pairs_df)
+
+
 def get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref=None):
     cache_df = dividend_cache_ref["df"] if dividend_cache_ref is not None else load_dividend_cache()
     cache_df = normalize_dividend_cache_df(cache_df)
@@ -364,11 +397,6 @@ def get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref=None):
         )
     dividend_cache_ref["dirty"] = True
     return cash_div_tax
-
-
-def is_prev_year_high_dividend(ts_code, dividend_year, dividend_cache_ref=None):
-    cash_div_tax = get_prev_year_cash_div_tax(ts_code, dividend_year, dividend_cache_ref)
-    return cash_div_tax >= PREV_YEAR_MIN_CASH_DIV_TAX
 
 
 def validate_runtime_config():

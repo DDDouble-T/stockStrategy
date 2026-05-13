@@ -53,7 +53,7 @@ STRATEGY_COMBINATIONS = [
     # pe_reasonable: 启用市盈率基础过滤，要求 PE 在合理区间 0-80；pe 为空时放行
     # industry_relative_valuation_low: 相对所属行业处于低估值区间
     # social_security_holder: 股东成分包含全国社保基金
-    # prev_year_high_dividend: 上一年度现金分红较高，10股税前大于1
+    # prev_year_high_dividend: TTM 股息率在设定区间内
     # main_money_inflow_2days: 主力资金连续流入2天
     },
 ]
@@ -105,7 +105,8 @@ def apply_runtime_config(config):
     choose_module.MAX_FORWARD_DAYS = config["max_forward_days"]
     choose_module.VOL_MA_DAYS = config["vol_ma_days"]
     choose_module.RSI_PERIOD = config["rsi_period"]
-    choose_module.PREV_YEAR_MIN_CASH_DIV_TAX = config["prev_year_min_cash_div_tax"]
+    choose_module.MIN_DV_TTM = normalize_optional_number(config["min_dv_ttm"])
+    choose_module.MAX_DV_TTM = normalize_optional_number(config["max_dv_ttm"])
     choose_module.CONDITION_FLAGS = config["conditions"]
     choose_module.RSI_MAX = config["rsi_max"]
     choose_module.NEAR_MA_THRESHOLD = config["near_ma_threshold"]
