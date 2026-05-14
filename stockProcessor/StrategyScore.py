@@ -36,6 +36,7 @@ import pandas as pd
 import StrategyChoose as sc
 import strategy_choose_config
 from stockProcessor.download.constants import data_path, result_path
+from stockProcessor.strategy_data_pipeline import prepare_initial_daily_data
 
 
 # ======================
@@ -186,11 +187,6 @@ def fetch_with_retry(fetch_func, label):
         return fetch_func()
     except Exception as e:
         raise RuntimeError(f"{label} 下载失败，已停止本次评分，避免使用不完整数据：{e}") from e
-
-
-def load_all_basic(ts_codes, trade_dates, daily_df=None) -> pd.DataFrame:
-    """统一复用 StrategyChoose 的基础面缓存与补齐逻辑。"""
-    return sc.load_all_basic(ts_codes, trade_dates, daily_df=daily_df)
 
 
 # ----------------------
@@ -947,46 +943,25 @@ def main():
     ts_codes = list(stock_info.keys())
     print(f"股票池数量（ST/BJ过滤后）：{len(ts_codes)}")
 
-    all_daily = sc.load_all_daily(ts_codes, trade_dates)
-    if all_daily.empty:
-        print("没有获取到日线数据")
-        return
-    if TOTAL_MV_FILTER_ENABLED:
-        # 评分阶段与筛选阶段保持一致：总市值统一使用最近一个交易日口径。
-        latest_total_mv_df = sc.load_latest_total_mv(ts_codes, trade_dates[-1])
-        all_daily = all_daily.merge(latest_total_mv_df, on=["ts_code"], how="left")
-
-    all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
-    if not all_basic.empty:
-        all_daily = all_daily.merge(
-            all_basic,
-            on=["ts_code", "trade_date"],
-            how="left"
-        )
-    basic_columns = ["volume_ratio", "turnover_rate", "pe", "pe_ttm"]
-    if EPS_FILTER_ENABLED:
-        basic_columns.append("eps")
-    if TOTAL_MV_FILTER_ENABLED:
-        basic_columns.append("total_mv")
-    for col in basic_columns:
-        if col not in all_daily.columns:
-            all_daily[col] = pd.NA
-    if hasattr(sc, "add_industry_valuation_metrics"):
-        all_daily = sc.add_industry_valuation_metrics(all_daily, stock_pool)
-    signal_df = all_daily[all_daily["trade_date"].astype(str).isin(set(signal_dates))].copy()
-    filtered_signal_df, basic_filter_summary = sc.apply_basic_filters(
-        signal_df,
-        stock_name_map=stock_info,
+    pipeline_result = prepare_initial_daily_data(
+        strategy_module=sc,
+        stock_pool=stock_pool,
+        ts_codes=ts_codes,
+        trade_dates=trade_dates,
+        signal_dates=signal_dates,
+        stock_info=stock_info,
         exclude_st=EXCLUDE_ST,
         exclude_bj=EXCLUDE_BJ,
         prefer_pe_ttm=True,
         estimate_eps_when_missing=True,
+        filter_context_label="评分信号窗口",
+        enable_industry_metrics=True,
     )
-    sc.print_basic_filter_summary(basic_filter_summary, "评分信号窗口")
-    eligible_signal_keys = set(zip(
-        filtered_signal_df["ts_code"].astype(str),
-        filtered_signal_df["trade_date"].astype(str),
-    ))
+    all_daily = pipeline_result["all_daily"]
+    if all_daily.empty:
+        print("没有获取到日线数据")
+        return
+    eligible_signal_keys = pipeline_result["eligible_signal_keys"]
     if not eligible_signal_keys:
         print("没有生成候选信号表，请检查数据窗口、基础过滤配置或股票池")
         return

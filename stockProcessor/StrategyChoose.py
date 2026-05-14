@@ -1,6 +1,7 @@
 import pandas as pd
 import tushare as ts
 import os
+import sys
 from copy import deepcopy
 from datetime import datetime, timedelta
 from openpyxl import Workbook
@@ -11,6 +12,8 @@ from module.config import tushare_config
 from stockProcessor import eps_download as eps_downloader
 from stockProcessor.download.constants import data_path, score_result_path
 import strategy_choose_config
+from stockProcessor.strategy_data_pipeline import prepare_initial_daily_data
+from stockProcessor import strategy_data_pipeline as sdp
 
 # ======================
 # 参数区
@@ -264,322 +267,35 @@ def add_daily_indicators(df):
     return df
 
 
-def normalize_daily_cache_df(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-    if "trade_date" in df.columns:
-        df["trade_date"] = df["trade_date"].astype(str)
-    return df
-
-
-def get_daily_cache_file_path(trade_date):
-    file_name = f"{str(trade_date)}_{os.path.basename(DAILY_CACHE_CSV)}"
-    return os.path.join(os.path.dirname(DAILY_CACHE_CSV), file_name)
-
-
-def read_daily_cache_file(cache_file):
-    if not os.path.exists(cache_file):
-        return pd.DataFrame()
-
-    df = pd.read_csv(cache_file, dtype={"ts_code": str, "trade_date": str})
-    return normalize_daily_cache_df(df)
-
-
-def load_daily_cache(trade_dates):
-    cached_frames = []
-    cached_dates = set()
-
-    for trade_date in trade_dates:
-        cache_file = get_daily_cache_file_path(trade_date)
-        date_df = read_daily_cache_file(cache_file)
-
-        if date_df.empty:
-            continue
-
-        cached_frames.append(date_df)
-        cached_dates.add(str(trade_date))
-
-    if not cached_frames:
-        return pd.DataFrame(), cached_dates
-
-    cache_df = pd.concat(cached_frames, ignore_index=True)
-    cache_df = cache_df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    cache_df = cache_df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
-    return cache_df, cached_dates
-
-
-def save_daily_cache(df):
-    if df is None or df.empty:
-        return
-
-    if "trade_date" not in df.columns:
-        raise ValueError("daily 缓存缺少 trade_date，无法按交易日拆分保存")
-
-    os.makedirs(os.path.dirname(DAILY_CACHE_CSV), exist_ok=True)
-    df = normalize_daily_cache_df(df)
-    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    for trade_date, date_df in df.groupby("trade_date"):
-        cache_file = get_daily_cache_file_path(trade_date)
-        date_df = date_df.sort_values(by=["ts_code"]).reset_index(drop=True)
-        date_df.to_csv(cache_file, index=False, encoding="utf-8-sig")
-
-
-def fetch_daily_by_trade_date(trade_date):
-    pro = pro_api()
-    return pro.daily(trade_date=trade_date)
-
-
-def load_moneyflow_cache():
-    if not os.path.exists(MONEYFLOW_CACHE_CSV):
-        return pd.DataFrame()
-    df = pd.read_csv(MONEYFLOW_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
-    if "trade_date" in df.columns:
-        df["trade_date"] = df["trade_date"].astype(str)
-    return df
-
-
-def save_moneyflow_cache(df):
-    os.makedirs(os.path.dirname(MONEYFLOW_CACHE_CSV), exist_ok=True)
-    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-    df = df.sort_values(by=["trade_date", "ts_code"]).reset_index(drop=True)
-    df.to_csv(MONEYFLOW_CACHE_CSV, index=False, encoding="utf-8-sig")
-
-
-def fetch_moneyflow_by_trade_date(trade_date):
-    pro = pro_api()
-    return pro.moneyflow(trade_date=trade_date)
-
-
 def load_all_moneyflow(trade_dates):
-    cache_df = load_moneyflow_cache()
-    cached_dates = set(cache_df["trade_date"].astype(str)) if not cache_df.empty and "trade_date" in cache_df.columns else set()
-
-    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in cached_dates]
-    if missing_dates:
-        print(f"资金流缓存缺失 {len(missing_dates)} 个交易日，开始补齐：{', '.join(missing_dates)}")
-    else:
-        print(f"资金流缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取")
-
-    for trade_date in missing_dates:
-        df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_moneyflow_by_trade_date(trade_date),
-            f"moneyflow {trade_date}"
-        )
-        if df.empty:
-            raise RuntimeError(f"moneyflow {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-        df["trade_date"] = df["trade_date"].astype(str)
-        cache_df = pd.concat([cache_df, df], ignore_index=True)
-        save_moneyflow_cache(cache_df)
-        print(f"已补齐资金流数据：{trade_date}")
-
-    columns = ["ts_code", "trade_date", "external_internal_ratio", "main_net", "main_inflow_2days"]
-    if cache_df.empty:
-        return pd.DataFrame(columns=columns)
-
-    buy_vol_columns = ["buy_sm_vol", "buy_md_vol", "buy_lg_vol", "buy_elg_vol"]
-    sell_vol_columns = ["sell_sm_vol", "sell_md_vol", "sell_lg_vol", "sell_elg_vol"]
-    money_amount_columns = ["buy_lg_amount", "buy_elg_amount", "sell_lg_amount", "sell_elg_amount"]
-
-    for col in buy_vol_columns + sell_vol_columns + money_amount_columns:
-        if col not in cache_df.columns:
-            cache_df[col] = 0
-        cache_df[col] = pd.to_numeric(cache_df[col], errors="coerce").fillna(0)
-
-    cache_df["external_vol"] = cache_df[buy_vol_columns].sum(axis=1)
-    cache_df["internal_vol"] = cache_df[sell_vol_columns].sum(axis=1)
-    cache_df["external_internal_ratio"] = (
-        cache_df["external_vol"] / cache_df["internal_vol"].where(cache_df["internal_vol"] > 0)
-    )
-    cache_df["main_net"] = (
-        cache_df["buy_lg_amount"]
-        + cache_df["buy_elg_amount"]
-        - cache_df["sell_lg_amount"]
-        - cache_df["sell_elg_amount"]
-    )
-
-    cache_df = cache_df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
-    cache_df["main_inflow"] = cache_df["main_net"] > 0
-    cache_df["prev_main_inflow"] = cache_df.groupby("ts_code")["main_inflow"].shift(1).eq(True)
-    cache_df["main_inflow_2days"] = cache_df["main_inflow"] & cache_df["prev_main_inflow"]
-
-    trade_date_set = set(trade_dates)
-    return cache_df[cache_df["trade_date"].isin(trade_date_set)][columns].copy()
-
-
-def load_basic_cache():
-    df = eps_downloader.load_basic_cache_file()
-    if df.empty:
-        return df
-
-    drop_columns = [col for col in ["total_mv", "eps"] if col in df.columns]
-    if drop_columns:
-        df = df.drop(columns=drop_columns)
-    numeric_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
-    for col in numeric_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def save_basic_cache(df):
-    df = df.drop(columns=["total_mv"], errors="ignore")
-    eps_downloader.upsert_basic_cache_rows(df)
-
-
-def fetch_daily_basic_by_trade_date(trade_date):
-    pro = pro_api()
-    fields = "ts_code,trade_date,pe,pe_ttm,volume_ratio,turnover_rate,dv_ttm"
-    return pro.daily_basic(
-        trade_date=trade_date,
-        fields=fields
-    )
-
-
-def fetch_total_mv_by_trade_date(trade_date):
-    pro = pro_api()
-    return pro.daily_basic(
-        trade_date=trade_date,
-        fields="ts_code,trade_date,total_mv"
+    return sdp.load_all_moneyflow(
+        trade_dates=trade_dates,
+        moneyflow_cache_csv=MONEYFLOW_CACHE_CSV,
+        fetch_moneyflow_by_trade_date=lambda trade_date: pro_api().moneyflow(trade_date=trade_date),
+        fetch_with_retry=fetch_with_retry,
     )
 
 
 def load_latest_total_mv(ts_codes, trade_date):
-    if not TOTAL_MV_FILTER_ENABLED:
-        return pd.DataFrame(columns=["ts_code", "total_mv"])
-
-    total_mv_df = fetch_with_retry(
-        lambda: fetch_total_mv_by_trade_date(trade_date),
-        f"daily_basic total_mv {trade_date}"
+    return sdp.load_latest_total_mv(
+        ts_codes=ts_codes,
+        trade_date=trade_date,
+        total_mv_filter_enabled=TOTAL_MV_FILTER_ENABLED,
+        fetch_with_retry=fetch_with_retry,
+        pro_api=pro_api,
     )
-    if total_mv_df.empty:
-        raise RuntimeError(f"daily_basic total_mv {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-
-    total_mv_df = total_mv_df.copy()
-    total_mv_df["ts_code"] = total_mv_df["ts_code"].astype(str)
-    total_mv_df["total_mv"] = pd.to_numeric(total_mv_df["total_mv"], errors="coerce")
-    ts_code_set = set(ts_codes)
-    total_mv_df = total_mv_df[total_mv_df["ts_code"].isin(ts_code_set)].copy()
-    total_mv_df = total_mv_df.drop_duplicates(subset=["ts_code"], keep="last")
-    print(
-        f"已拉取最近交易日总市值：{trade_date}，"
-        f"{len(total_mv_df)} 只股票"
-    )
-    return total_mv_df[["ts_code", "total_mv"]]
-
-
-def merge_basic_frames(daily_basic_df, trade_date):
-    daily_basic_columns = ["ts_code", "trade_date", "pe", "pe_ttm", "volume_ratio", "turnover_rate", "dv_ttm"]
-    if daily_basic_df is None or daily_basic_df.empty:
-        daily_basic_df = pd.DataFrame(columns=daily_basic_columns)
-
-    daily_basic_df = daily_basic_df.copy()
-
-    if "trade_date" not in daily_basic_df.columns:
-        daily_basic_df["trade_date"] = trade_date
-
-    merged = daily_basic_df.copy()
-
-    if "pe_ttm" in merged.columns:
-        merged["pe"] = merged["pe_ttm"].where(merged["pe_ttm"].notna(), merged.get("pe"))
-
-    columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"]
-    for col in columns:
-        if col not in merged.columns:
-            merged[col] = pd.NA
-
-    return merged[columns].copy()
 
 
 def load_all_basic(ts_codes, trade_dates, daily_df=None):
-    cache_df = load_basic_cache()
-    required_columns = {"ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"}
-    cache_has_required_columns = required_columns.issubset(set(cache_df.columns))
-    valid_cached_dates = set()
-    invalid_cached_dates = []
-    expected_counts = {}
-    if daily_df is not None and not daily_df.empty and "trade_date" in daily_df.columns:
-        expected_counts = (
-            daily_df.assign(trade_date=daily_df["trade_date"].astype(str))
-            .groupby("trade_date")["ts_code"]
-            .nunique()
-            .to_dict()
-        )
-    if cache_has_required_columns and not cache_df.empty and "trade_date" in cache_df.columns:
-        trade_date_cache = cache_df["trade_date"].astype(str)
-        for trade_date in trade_dates:
-            date_df = cache_df[trade_date_cache == trade_date]
-            if date_df.empty:
-                continue
-
-            daily_basic_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
-            daily_basic_ready = date_df[daily_basic_columns].notna().any(axis=0).all()
-            expected_count = expected_counts.get(trade_date)
-            coverage_ready = True
-            if expected_count:
-                coverage_ready = date_df["ts_code"].nunique() >= max(1, int(expected_count * 0.9))
-
-            if daily_basic_ready and coverage_ready:
-                valid_cached_dates.add(trade_date)
-            else:
-                invalid_cached_dates.append(trade_date)
-
-    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in valid_cached_dates]
-    if missing_dates:
-        message = f"基础面缓存缺失或不完整 {len(missing_dates)} 个交易日，开始补齐：{', '.join(missing_dates)}"
-        if invalid_cached_dates:
-            message += f"；其中缓存不完整日期：{', '.join(invalid_cached_dates)}"
-        print(message)
-    else:
-        print(f"基础面缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取")
-
-    for trade_date in missing_dates:
-        daily_basic_df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_daily_basic_by_trade_date(trade_date),
-            f"daily_basic {trade_date}"
-        )
-        if daily_basic_df.empty:
-            raise RuntimeError(f"daily_basic {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-        merged = merge_basic_frames(daily_basic_df, trade_date)
-        if not merged.empty:
-            cache_df = pd.concat([cache_df, merged], ignore_index=True)
-            save_basic_cache(cache_df)
-            print(f"已补齐基础面数据：{trade_date}")
-
-    if cache_df.empty:
-        columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "dv_ttm"]
-        if EPS_FILTER_ENABLED:
-            columns.insert(2, "eps")
-        return pd.DataFrame(columns=columns)
-
-    ts_code_set = set(ts_codes)
-    trade_date_set = set(trade_dates)
-    result = cache_df[
-        cache_df["ts_code"].isin(ts_code_set)
-        & cache_df["trade_date"].isin(trade_date_set)
-    ].copy()
-    result_columns = ["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe"]
-    result = result[[col for col in result_columns if col in result.columns]].copy()
-    if EPS_FILTER_ENABLED:
-        # EPS 改为独立下载；主流程只读取 basic 缓存文件里已准备好的结果，不再顺手触发 bak_basic 下载。
-        eps_cache_df = eps_downloader.load_eps_cache()
-        if not eps_cache_df.empty:
-            eps_result = eps_cache_df[
-                eps_cache_df["ts_code"].isin(ts_code_set)
-                & eps_cache_df["trade_date"].isin(trade_date_set)
-            ][["ts_code", "trade_date", "eps"]].copy()
-            result = result.merge(eps_result, on=["ts_code", "trade_date"], how="left")
-        else:
-            result["eps"] = pd.NA
-        result_columns.insert(2, "eps")
-        result = result[[col for col in result_columns if col in result.columns]].copy()
-    print(
-        f"本次使用基础面缓存：{len(result)} 行，"
-        f"{result['trade_date'].nunique() if not result.empty else 0} 个交易日，"
-        f"{result['ts_code'].nunique() if not result.empty else 0} 只股票"
+    return sdp.load_all_basic(
+        ts_codes=ts_codes,
+        trade_dates=trade_dates,
+        daily_df=daily_df,
+        eps_filter_enabled=EPS_FILTER_ENABLED,
+        eps_downloader=eps_downloader,
+        fetch_with_retry=fetch_with_retry,
+        pro_api=pro_api,
     )
-    return result
 
 
 def load_shareholder_cache():
@@ -666,41 +382,13 @@ def is_ttm_dividend_yield_in_range(dv_ttm):
 
 
 def load_all_daily(ts_codes, trade_dates):
-    cache_df, cached_dates = load_daily_cache(trade_dates)
-
-    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in cached_dates]
-    if missing_dates:
-        print(f"日线缓存缺失 {len(missing_dates)} 个交易日，开始补齐：{', '.join(missing_dates)}")
-    else:
-        print(f"日线缓存已命中最近 {len(trade_dates)} 个交易日，无需重新拉取 daily")
-
-    for trade_date in missing_dates:
-        df = fetch_with_retry(
-            lambda trade_date=trade_date: fetch_daily_by_trade_date(trade_date),
-            f"daily {trade_date}"
-        )
-        if df.empty:
-            raise RuntimeError(f"daily {trade_date} 返回空数据，已停止本次任务，避免使用不完整数据")
-        df["trade_date"] = df["trade_date"].astype(str)
-        save_daily_cache(df)
-        cache_df = pd.concat([cache_df, df], ignore_index=True)
-        print(f"已补齐日线数据：{trade_date}")
-
-    if cache_df.empty:
-        return pd.DataFrame()
-
-    ts_code_set = set(ts_codes)
-    trade_date_set = set(trade_dates)
-    result = cache_df[
-        cache_df["ts_code"].isin(ts_code_set)
-        & cache_df["trade_date"].isin(trade_date_set)
-    ].copy()
-    print(
-        f"本次使用日线缓存：{len(result)} 行，"
-        f"{result['trade_date'].nunique() if not result.empty else 0} 个交易日，"
-        f"{result['ts_code'].nunique() if not result.empty else 0} 只股票"
+    return sdp.load_all_daily(
+        ts_codes=ts_codes,
+        trade_dates=trade_dates,
+        daily_cache_csv=DAILY_CACHE_CSV,
+        fetch_daily_by_trade_date=lambda trade_date: pro_api().daily(trade_date=trade_date),
+        fetch_with_retry=fetch_with_retry,
     )
-    return result
 
 
 def add_stat(stats, key):
@@ -1133,41 +821,24 @@ def choose_strategy(stock_pool=None, end_date=END_DATE):
         for _, row in stock_pool.iterrows()
     }
     ts_codes = list(stock_info.keys())
-    all_daily = load_all_daily(ts_codes, trade_dates)
+    pipeline_result = prepare_initial_daily_data(
+        strategy_module=sys.modules[__name__],
+        stock_pool=stock_pool,
+        ts_codes=ts_codes,
+        trade_dates=trade_dates,
+        signal_dates=signal_dates,
+        stock_info=stock_info,
+        exclude_st=RUNTIME_CONFIG["exclude_st_stocks"],
+        exclude_bj=False,
+        prefer_pe_ttm=False,
+        estimate_eps_when_missing=False,
+        filter_context_label="筛选信号窗口",
+        enable_industry_metrics=True,
+    )
+    all_daily = pipeline_result["all_daily"]
     if all_daily.empty:
         return pd.DataFrame()
-    if TOTAL_MV_FILTER_ENABLED:
-        # 总市值过滤按最近一个交易日口径执行，不跟随历史信号日回溯。
-        latest_total_mv_df = load_latest_total_mv(ts_codes, trade_dates[-1])
-        all_daily = all_daily.merge(latest_total_mv_df, on=["ts_code"], how="left")
-    all_basic = load_all_basic(ts_codes, trade_dates, daily_df=all_daily)
-    if not all_basic.empty:
-        all_daily = all_daily.merge(
-            all_basic,
-            on=["ts_code", "trade_date"],
-            how="left"
-        )
-    required_basic_columns = ["volume_ratio", "turnover_rate", "pe", "dv_ttm"]
-    if EPS_FILTER_ENABLED:
-        required_basic_columns.append("eps")
-    for col in required_basic_columns:
-        if col not in all_daily.columns:
-            all_daily[col] = pd.NA
-    if TOTAL_MV_FILTER_ENABLED and "total_mv" not in all_daily.columns:
-        all_daily["total_mv"] = pd.NA
-    all_daily = add_industry_valuation_metrics(all_daily, stock_pool)
-    signal_df = all_daily[all_daily["trade_date"].astype(str).isin(set(signal_dates))].copy()
-    filtered_signal_df, basic_filter_summary = apply_basic_filters(
-        signal_df,
-        stock_name_map=stock_info,
-        exclude_st=RUNTIME_CONFIG["exclude_st_stocks"],
-        prefer_pe_ttm=False,
-    )
-    print_basic_filter_summary(basic_filter_summary, "筛选信号窗口")
-    eligible_signal_keys = set(zip(
-        filtered_signal_df["ts_code"].astype(str),
-        filtered_signal_df["trade_date"].astype(str),
-    ))
+    eligible_signal_keys = pipeline_result["eligible_signal_keys"]
     if not eligible_signal_keys:
         return pd.DataFrame()
     if moneyflow_needed:
