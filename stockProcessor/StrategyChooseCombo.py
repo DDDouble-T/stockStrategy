@@ -14,33 +14,55 @@ from stockProcessor.download.constants import score_result_path
 # ======================
 # 参数区
 # ======================
-# 这里直接配置两个“条件 key 列表”，风格与 StrategyScore 的 CONDITION_KEYS 一致。
+
+# 这里配置一个或多个“条件 key 列表”，风格与 StrategyScore 的 CONDITION_KEYS 一致。
 # 每个组合只启用列表里的条件，其余条件关闭；基础过滤仍沿用 choose 默认配置。
+# 各组合的 label 请在 Excel 工作表名中保持唯一（建议简短，总长不超过约 25 字以便加「入选」后缀）。
 STRATEGY_COMBINATIONS = [
     {
         "label": "策略1",
         "condition_keys": [
             "bullish_ma_alignment",
             "position_rule",
+            "volume_rule",
             "rsi_not_overheated",
-            "volume_ratio_high",
             "turnover_rate_range",
+            "main_money_inflow_2days",
+            "volume_ratio_high",
             "industry_relative_valuation_low",
-            "social_security_holder",
-            "main_money_inflow_2days"
+            "social_security_holder"
         ],
     },
     {
         "label": "策略2",
         "condition_keys": [
-            "bullish_ma_alignment",
             "position_rule",
             "volume_rule",
             "macd_golden_cross",
             "rsi_not_overheated",
+            "volume_ratio_high",
             "turnover_rate_range",
+            "industry_relative_valuation_low",
+            "prev_year_high_dividend",
             "main_money_inflow_2days"
         ],
+    },
+    {
+        "label": "策略3",
+        "condition_keys": [
+            "bullish_ma_alignment",
+            "position_rule",
+            "volume_rule",
+            "rsi_not_overheated",
+            "volume_ratio_high",
+            "external_internal_ratio_high",
+            "turnover_rate_range",
+            "industry_relative_valuation_low",
+            "social_security_holder",
+            "prev_year_high_dividend",
+            "main_money_inflow_2days"
+        ],
+    },
 # trend_above_ma20: 股价在20日线之上
     # bullish_ma_alignment: 5日 > 10日 > 20日
     # volume_rule: 上涨放量或回调缩量
@@ -55,7 +77,6 @@ STRATEGY_COMBINATIONS = [
     # social_security_holder: 股东成分包含全国社保基金
     # prev_year_high_dividend: TTM 股息率在设定区间内
     # main_money_inflow_2days: 主力资金连续流入2天
-    },
 ]
 END_DATE = None  # None 表示自动取最近一个 daily + moneyflow 都已就绪的交易日
 TOP_N = 5
@@ -220,7 +241,7 @@ def merge_strategy_details(detail_frames, combos):
 
     # 合并口径是并集：
     # 只要某只股票在某个 signal_date 命中任一组合，就保留；
-    # 如果两个组合都命中，则按 signal_date + ts_code 去重后保留一条，并记录命中来源。
+    # 若多个组合都命中，则按 signal_date + ts_code 去重后保留一条，并记录命中来源。
     dedup_df = combined_df.sort_values(
         by=["signal_date", "ts_code", "forward_day", "future_date", "strategy_label"]
     ).drop_duplicates(
@@ -305,9 +326,8 @@ def calc_stock_score(df):
     }
 
 
-def load_score_history(ts_codes, end_date, lookback_trade_days):
-    default_config = build_runtime_config(STRATEGY_COMBINATIONS[0])
-    apply_runtime_config(default_config)
+def load_score_history(ts_codes, end_date, lookback_trade_days, reference_config):
+    apply_runtime_config(reference_config)
 
     trade_dates = choose_module.get_trade_dates(end_date, count=lookback_trade_days)
     daily_df = choose_module.load_all_daily(ts_codes, trade_dates)
@@ -342,8 +362,12 @@ def score_merged_stocks(merged_base_df, runtime_configs, end_date):
         max(config["data_lookback_trade_days"], 80)
         for config in runtime_configs
     )
+    reference_config = max(
+        runtime_configs,
+        key=lambda cfg: cfg["data_lookback_trade_days"],
+    )
     ts_codes = sorted(merged_base_df["ts_code"].astype(str).unique().tolist())
-    history_df = load_score_history(ts_codes, end_date, lookback_trade_days)
+    history_df = load_score_history(ts_codes, end_date, lookback_trade_days, reference_config)
     if history_df.empty:
         raise RuntimeError("评分所需历史数据为空，无法继续生成合并结果")
 
@@ -624,6 +648,23 @@ def build_summary_rows(combos, runtime_configs, end_date, merged_base_df, ranked
     return pd.DataFrame(rows)
 
 
+def allocate_strategy_sheet_title(label, used_titles, max_len=31):
+    """Excel 工作表名最长 31 字符，且同簿内不可重复。"""
+    raw = f"{label}入选" if label else "策略入选"
+    base = raw[:max_len]
+    if base not in used_titles:
+        used_titles.add(base)
+        return base
+    n = 2
+    while True:
+        suffix = f"_{n}"
+        candidate = (raw[: max_len - len(suffix)] + suffix)[:max_len]
+        if candidate not in used_titles:
+            used_titles.add(candidate)
+            return candidate
+        n += 1
+
+
 def save_result_excel(
     topn_display_df,
     ranked_base_df,
@@ -641,10 +682,16 @@ def save_result_excel(
     rank_sheet = workbook.create_sheet(f"每日Top{TOP_N}")
     merged_sheet = workbook.create_sheet("合并明细")
     summary_sheet = workbook.create_sheet("策略说明")
-    strategy_sheets = [
-        workbook.create_sheet(f"{combo['label']}入选")
-        for combo in combos
-    ]
+    used_sheet_titles = {
+        topn_sheet.title,
+        rank_sheet.title,
+        merged_sheet.title,
+        summary_sheet.title,
+    }
+    strategy_sheets = []
+    for combo in combos:
+        title = allocate_strategy_sheet_title(combo.get("label") or "", used_sheet_titles)
+        strategy_sheets.append(workbook.create_sheet(title))
 
     fill_topn_sheet(topn_sheet, topn_display_df)
     choose_module.fill_dataframe_sheet(rank_sheet, build_rank_detail_table(ranked_base_df[ranked_base_df["is_top_n"]].copy()))
@@ -658,8 +705,8 @@ def save_result_excel(
 
 
 def main():
-    if len(STRATEGY_COMBINATIONS) != 2:
-        raise ValueError("STRATEGY_COMBINATIONS 必须且只能配置两个策略组合")
+    if len(STRATEGY_COMBINATIONS) < 1:
+        raise ValueError("STRATEGY_COMBINATIONS 至少需要配置一个策略组合")
 
     end_date = resolve_common_end_date(STRATEGY_COMBINATIONS)
     strategy_frames = []
@@ -672,7 +719,7 @@ def main():
 
     merged_detail_df, merged_base_df = merge_strategy_details(strategy_frames, STRATEGY_COMBINATIONS)
     if merged_base_df.empty:
-        print("两个策略组合都没有筛选出结果，未生成横向收益表")
+        print("所有策略组合均未筛选出结果，未生成横向收益表")
         return
 
     ranked_base_df = score_merged_stocks(merged_base_df, runtime_configs, end_date)
