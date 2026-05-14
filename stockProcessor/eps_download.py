@@ -41,7 +41,7 @@ BAK_BASIC_MIN_INTERVAL_SECONDS = int(RUNTIME_CONFIG.get("bak_basic_min_interval_
 BASIC_CACHE_CSV = data_path("strategy_basic_cache.csv")
 LAST_BAK_BASIC_FETCH_TS = None
 KEY_COLUMNS = ["ts_code", "trade_date"]
-BASIC_NUMERIC_COLUMNS = ["volume_ratio", "turnover_rate", "pe", "eps", "dv_ttm"]
+BASIC_NUMERIC_COLUMNS = ["volume_ratio", "turnover_rate", "pe", "eps"]
 
 
 def pro_api():
@@ -91,7 +91,7 @@ def get_trade_dates(start_date, end_date):
 
 def normalize_basic_cache_df(df):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "eps", "dv_ttm"])
+        return pd.DataFrame(columns=["ts_code", "trade_date", "volume_ratio", "turnover_rate", "pe", "eps"])
 
     df = df.copy()
     for col in ["ts_code", "trade_date"]:
@@ -99,7 +99,7 @@ def normalize_basic_cache_df(df):
             df[col] = pd.NA
         df[col] = df[col].astype(str)
 
-    drop_columns = [col for col in ["total_mv"] if col in df.columns]
+    drop_columns = [col for col in ["total_mv", "dv_ttm"] if col in df.columns]
     if drop_columns:
         df = df.drop(columns=drop_columns)
 
@@ -108,7 +108,7 @@ def normalize_basic_cache_df(df):
             df[col] = pd.NA
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    base_columns = KEY_COLUMNS + ["volume_ratio", "turnover_rate", "pe", "eps", "dv_ttm"]
+    base_columns = KEY_COLUMNS + ["volume_ratio", "turnover_rate", "pe", "eps"]
     extra_columns = [col for col in df.columns if col not in base_columns]
     df = df[base_columns + extra_columns]
     df = df.drop_duplicates(subset=KEY_COLUMNS, keep="last")

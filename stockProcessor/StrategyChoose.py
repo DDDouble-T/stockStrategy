@@ -388,6 +388,7 @@ def load_all_daily(ts_codes, trade_dates):
         daily_cache_csv=DAILY_CACHE_CSV,
         fetch_daily_by_trade_date=lambda trade_date: pro_api().daily(trade_date=trade_date),
         fetch_with_retry=fetch_with_retry,
+        pro_api=pro_api,
     )
 
 

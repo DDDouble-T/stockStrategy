@@ -139,7 +139,7 @@ BUCKET_LABELS = ["<=-10%", "-10~-5%", "-5~-3%", "-3~0%", "0~3%", "3~5%", "5~10%"
 # ======================
 
 # EPS、PE 和 ST 属于基础过滤：先排除不合格样本，不参与策略条件组合评分。
-# 股息率条件直接复用 choose 的 daily_basic 口径，避免额外分红缓存造成口径分叉。
+# 股息率条件与日线同日更新：dv_ttm 来自日线分文件缓存中的 daily_basic 字段，不经 strategy_basic_cache。
 CONDITION_KEYS = [
     "bullish_ma_alignment",          # 5日 > 10日 > 20日
     "volume_rule",                   # 上涨放量或回调缩量
