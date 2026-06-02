@@ -5,8 +5,13 @@ StrategyScore.py
 用途：
 1. 遍历当前策略条件的“3个及以上”组合；
 2. 用 base_close 作为信号验证基准价，不模拟真实买入成交；
-3. 统计信号出现后第 3/5/10/20/30 个交易日的表现；
+3. 统计信号出现后第 3/5/10/20/30 个交易日的表现（相对基准指数的超额收益）；
 4. 为每个组合在不同周期上的能力打分，并导出 Excel。
+
+收益口径：
+- 默认基准为沪深300（000300.SH）；
+- close_pct / period_high_pct / period_low_pct 等均为「个股涨跌幅 − 同期指数涨跌幅」，
+  用于减弱大盘整体涨跌对策略排名的影响。
 
 本版评分机制：
 - period_scores 同时输出 raw_score 与 score；
@@ -15,7 +20,7 @@ StrategyScore.py
 - 回撤惩罚采用“周期容忍回撤”机制，只惩罚超过正常波动的部分；
 - 不再鼓励大样本：新增“筛选密度惩罚”，筛出太多股票会扣分；
 - 筛选密度分母使用 EPS + PE 基础过滤 + ST/BJ 过滤之后的候选信号池；
-- 样本惩罚仅保留极小样本轻惩罚，避免精选策略被大幅压分；
+- 小样本分级惩罚，引导榜首 sample_count_max 约 3~10，n=1 难进前列；
 - 收益分权重上调，让策略排名更偏向真实收益兑现能力。
 
 放置位置：
@@ -61,6 +66,11 @@ MIN_COMBO_SIZE = 4
 RESULT_XLSX = result_path("strategy_score_result.xlsx")
 DETAIL_CSV = result_path("strategy_score_detail.csv")
 MONEYFLOW_CACHE_CSV = data_path("strategy_moneyflow_cache.csv")
+INDEX_DAILY_CACHE_CSV = data_path("strategy_index_daily_cache.csv")
+
+# 超额收益基准指数（TuShare ts_code）
+BENCHMARK_INDEX_TS_CODE = "000300.SH"
+BENCHMARK_INDEX_NAME = "沪深300"
 
 # 是否只测试少数股票。None 表示全市场。
 # TEST_TS_CODES = ["002709.SZ", "000938.SZ"]
@@ -117,6 +127,22 @@ MAX_DV_TTM = getattr(
 # 如果某组合命中 20000 行，selection_rate≈4.76%，说明太宽，会扣分。
 TARGET_SELECTION_RATE = 0.005   # <=0.5%：精选，不扣分
 MAX_OK_SELECTION_RATE = 0.02    # 0.5%~2%：轻扣；>2%：明显扣分
+
+# 小样本惩罚：引导榜首 sample_count_max 落在 3~10，n=1 难进前列，无需 >20 才有竞争力。
+# 周期惩罚在 calc_period_score 中按各 forward_day 的 sample_count 扣除；
+# 组合惩罚在 evaluate_combos 中按 sample_count_max 再扣一次。
+SMALL_SAMPLE_PENALTY_BY_COUNT = {
+    1: 42.0,
+    2: 28.0,
+    3: 14.0,
+    6: 7.0,
+    10: 2.0,
+}
+COMBO_MIN_SAMPLE_PENALTY_BY_MAX = {
+    1: 18.0,
+    2: 10.0,
+    3: 4.0,
+}
 
 # 周期权重：最终 total_raw_score 会按这个权重加权。
 # 你的策略是一周到一个月，所以 10/20 日权重最高；5 日贴近一周；30 日用于观察延续性。
@@ -274,6 +300,157 @@ def load_all_moneyflow(trade_dates):
     return cache_df[["ts_code", "trade_date", "external_internal_ratio", "main_net", "main_inflow_2days"]].copy()
 
 
+# ----------------------
+# 基准指数日线：用于计算超额收益
+# ----------------------
+
+def load_index_daily_cache() -> pd.DataFrame:
+    if not os.path.exists(INDEX_DAILY_CACHE_CSV):
+        return pd.DataFrame()
+    df = pd.read_csv(INDEX_DAILY_CACHE_CSV, dtype={"ts_code": str, "trade_date": str})
+    if "trade_date" in df.columns:
+        df["trade_date"] = df["trade_date"].astype(str)
+    return df
+
+
+def save_index_daily_cache(df: pd.DataFrame):
+    os.makedirs(os.path.dirname(INDEX_DAILY_CACHE_CSV), exist_ok=True)
+    df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+    df = df.sort_values(by=["ts_code", "trade_date"]).reset_index(drop=True)
+    df.to_csv(INDEX_DAILY_CACHE_CSV, index=False, encoding="utf-8-sig")
+
+
+def fetch_index_daily_range(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    pro = sc.pro_api()
+    return pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+
+def load_benchmark_index_daily(trade_dates: list) -> pd.DataFrame:
+    if not trade_dates:
+        return pd.DataFrame()
+
+    ts_code = BENCHMARK_INDEX_TS_CODE
+    start_date = trade_dates[0]
+    end_date = trade_dates[-1]
+    cache_df = load_index_daily_cache()
+    if cache_df.empty:
+        cached_dates = set()
+    else:
+        cached_dates = set(
+            cache_df.loc[cache_df["ts_code"] == ts_code, "trade_date"].astype(str).tolist()
+        )
+
+    required_dates = set(trade_dates)
+    missing_dates = sorted(required_dates - cached_dates)
+    if missing_dates:
+        print(f"指数 {BENCHMARK_INDEX_NAME}({ts_code}) 缓存缺失 {len(missing_dates)} 个交易日，开始补齐")
+        df = fetch_with_retry(
+            lambda: fetch_index_daily_range(ts_code, start_date, end_date),
+            f"index_daily {ts_code}",
+        )
+        if df.empty:
+            raise RuntimeError(f"index_daily {ts_code} 返回空数据，已停止本次评分，避免使用不完整数据")
+        df["trade_date"] = df["trade_date"].astype(str)
+        df["ts_code"] = df["ts_code"].astype(str)
+        cache_df = pd.concat([cache_df, df], ignore_index=True)
+        save_index_daily_cache(cache_df)
+        print(f"已补齐指数日线：{BENCHMARK_INDEX_NAME} {start_date}~{end_date}")
+
+    index_df = cache_df[cache_df["ts_code"] == ts_code].copy()
+    index_df = index_df[index_df["trade_date"].isin(trade_dates)]
+    for col in ["close", "high", "low"]:
+        index_df[col] = pd.to_numeric(index_df[col], errors="coerce")
+    index_df = index_df.sort_values("trade_date").reset_index(drop=True)
+
+    still_missing = sorted(required_dates - set(index_df["trade_date"].astype(str)))
+    if still_missing:
+        raise RuntimeError(
+            f"指数 {ts_code} 仍缺少 {len(still_missing)} 个交易日数据，"
+            f"示例：{still_missing[:5]}"
+        )
+    return index_df
+
+
+def build_index_forward_lookup(index_df: pd.DataFrame, trade_dates: list) -> dict:
+    """
+    按与个股相同的规则，预计算基准指数在各信号日、各 forward_day 上的涨跌幅。
+    返回 dict[(signal_date, forward_day)] -> metrics 或 None（数据不足）。
+    """
+    date_to_pos = {d: i for i, d in enumerate(trade_dates)}
+    index_rows = {
+        str(row.trade_date): row
+        for row in index_df.itertuples(index=False)
+    }
+    lookup = {}
+
+    for signal_date in trade_dates:
+        i = date_to_pos[signal_date]
+        row = index_rows.get(signal_date)
+        if row is None:
+            for h in FORWARD_DAYS:
+                lookup[(signal_date, h)] = None
+            continue
+
+        base_close = row.close
+        if pd.isna(base_close) or base_close <= 0:
+            for h in FORWARD_DAYS:
+                lookup[(signal_date, h)] = None
+            continue
+
+        for h in FORWARD_DAYS:
+            future_pos = i + h
+            if future_pos >= len(trade_dates):
+                lookup[(signal_date, h)] = None
+                continue
+
+            future_date = trade_dates[future_pos]
+            future_row = index_rows.get(future_date)
+            if future_row is None:
+                lookup[(signal_date, h)] = None
+                continue
+
+            window_dates = trade_dates[i + 1: future_pos + 1]
+            window_rows = [index_rows[d] for d in window_dates if d in index_rows]
+            if len(window_rows) != len(window_dates):
+                lookup[(signal_date, h)] = None
+                continue
+
+            future_close = future_row.close
+            future_high = future_row.high
+            future_low = future_row.low
+            period_high = max(r.high for r in window_rows)
+            period_low = min(r.low for r in window_rows)
+
+            lookup[(signal_date, h)] = {
+                "close_pct": (future_close / base_close - 1) * 100,
+                "high_pct": (future_high / base_close - 1) * 100,
+                "low_pct": (future_low / base_close - 1) * 100,
+                "period_high_pct": (period_high / base_close - 1) * 100,
+                "period_low_pct": (period_low / base_close - 1) * 100,
+            }
+
+    return lookup
+
+
+def apply_excess_returns_to_item(item: dict, h: int, index_metrics: dict | None):
+    """将 item 中的涨跌幅字段改为相对基准指数的超额收益。"""
+    if not index_metrics:
+        item[f"valid_{h}"] = False
+        for suffix in ("close_pct", "high_pct", "low_pct", "period_high_pct", "period_low_pct"):
+            item[f"{suffix}_{h}"] = np.nan
+        return
+
+    for suffix in ("close_pct", "high_pct", "low_pct", "period_high_pct", "period_low_pct"):
+        key = f"{suffix}_{h}"
+        stock_val = item[key]
+        bench_val = index_metrics[suffix]
+        if pd.isna(stock_val) or pd.isna(bench_val):
+            item[key] = np.nan
+            item[f"valid_{h}"] = False
+        else:
+            item[key] = stock_val - bench_val
+
+
 # ======================
 # 股票池 / 条件预计算
 # ======================
@@ -322,6 +499,7 @@ def build_condition_base_df(
     eligible_signal_keys: set,
     moneyflow_df: pd.DataFrame,
     shareholder_cache_ref: dict,
+    index_forward_lookup: dict,
 ):
     """
     生成“信号候选表”。
@@ -331,7 +509,8 @@ def build_condition_base_df(
     - base_close：筛选日收盘价，作为本次信号验证基准价；
     - 每个单项条件的 True/False；
     - 第 3/5/10/20/30 个交易日后的 close/high/low 差值与涨跌幅；
-    - 信号后 1~N 日区间最高/最低，用于评分时衡量冲高能力和回撤风险。
+    - 信号后 1~N 日区间最高/最低，用于评分时衡量冲高能力和回撤风险；
+    - 涨跌幅类字段为相对基准指数的超额收益（个股 − 指数）。
 
     重要：
     - ST/BJ、EPS、PE、总市值都在外层统一基础过滤；
@@ -499,6 +678,12 @@ def build_condition_base_df(
                     item[f"period_high_pct_{h}"] = (period_high / base_close - 1) * 100
                     item[f"period_low_pct_{h}"] = (period_low / base_close - 1) * 100
 
+                    apply_excess_returns_to_item(
+                        item,
+                        h,
+                        index_forward_lookup.get((signal_date, h)),
+                    )
+
                 rows.append(item)
 
         except Exception as e:
@@ -522,20 +707,35 @@ def combo_to_name(combo):
     return " + ".join(CONDITION_NAME.get(k, k) for k in combo)
 
 
+def _lookup_tier_penalty(value: int, tiers: dict[int, float]) -> float:
+    """按 tiers 的键（样本上界，升序）取第一个满足 value <= 上界的惩罚。"""
+    for upper_bound in sorted(tiers):
+        if value <= upper_bound:
+            return tiers[upper_bound]
+    return 0.0
+
+
 def calc_small_sample_penalty(sample_count: int) -> float:
     """
-    极小样本轻惩罚。
+    周期级小样本惩罚。
 
-    你的目标是“精选少量股票”，所以不再用过去那种 <30 样本就重扣的逻辑。
-    但如果历史样本极少，例如只有 1~4 个，也可能是偶然性很强，所以保留轻惩罚。
+    目标：榜首 sample_count_max 约 3~10；n=1~2 明显吃亏，3~6 可参与竞争，
+    7~10 几乎不扣，11~20 与更大样本不再额外惩罚。
     """
-    if sample_count < 5:
-        return 8.0
-    if sample_count < 10:
-        return 3.0
-    if sample_count < 30:
-        return 1.0
-    return 0.0
+    if sample_count > 20:
+        return 0.0
+    return _lookup_tier_penalty(sample_count, SMALL_SAMPLE_PENALTY_BY_COUNT)
+
+
+def calc_combo_min_sample_penalty(sample_count_max: int) -> float:
+    """
+    组合级惩罚：按各周期 sample_count 的最大值再扣一次。
+
+    sample_count_max 在 4~10 不扣；<=3 递减扣分，避免单周期偶然高分霸榜。
+    """
+    if sample_count_max > 10:
+        return 0.0
+    return _lookup_tier_penalty(sample_count_max, COMBO_MIN_SAMPLE_PENALTY_BY_MAX)
 
 
 def calc_selection_penalty(selection_rate: float) -> float:
@@ -547,7 +747,7 @@ def calc_selection_penalty(selection_rate: float) -> float:
     设计目标：
     - 你希望每天筛出的是少量精选票，而不是几百只大样本；
     - 因此“筛得太多”要扣分；
-    - 筛得少不扣分，但极小历史样本由 calc_small_sample_penalty 轻扣。
+    - 筛得少不扣分，但极小历史样本由 calc_small_sample_penalty 重扣。
 
     阈值说明：
     - <=0.5%：精选，不扣；
@@ -571,6 +771,7 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
     重要设计：
     1. raw_score 可以为负，用于排名和总分。
        原因：如果某个周期表现明显差，应该拖累总分；否则把负分抹成0会高估策略。
+       收益/冲高/回撤相关指标已换算为相对基准指数的超额收益。
 
     2. score = max(0, raw_score)，只用于展示。
        这样 Excel 里既能看真实 raw_score，也能看非负展示分。
@@ -578,8 +779,7 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
     3. 回撤惩罚不是“有回撤就扣很多”，而是“超过可容忍回撤才扣”。
        因为你做的是一周到一个月的短中线，正常回踩并不一定是坏事。
 
-    4. 样本惩罚只保留“极小样本轻惩罚”。
-       你希望筛出小样本，所以不再鼓励大样本，也不再因为 <30 样本就重扣。
+    4. 样本惩罚引导榜首 sample_count_max 约 3~10，n=1 难进前列。
     """
     sample_count = int(metric["sample_count"])
     avg_close_pct = metric["avg_close_pct"]
@@ -651,7 +851,7 @@ def calc_period_score(metric: dict, forward_day: int) -> dict:
     # 5. 波动惩罚：收益波动过大，说明策略稳定性差或依赖少数极端样本。
     volatility_penalty = std_close_pct * 0.4
 
-    # 6. 样本惩罚：只对极小样本轻扣，不再因为 <30 就大幅扣分。
+    # 6. 样本惩罚：样本越少扣分越重。
     sample_penalty = calc_small_sample_penalty(sample_count)
 
     raw_score = (
@@ -817,7 +1017,8 @@ def evaluate_combos(base_df: pd.DataFrame):
         if total_weight > 0:
             total_raw = total_raw_score / total_weight
             total_display = total_display_score / total_weight
-            adjusted_total_raw = total_raw - selection_penalty
+            min_sample_penalty = calc_combo_min_sample_penalty(sample_count_max)
+            adjusted_total_raw = total_raw - selection_penalty - min_sample_penalty
 
             rank_rows.append({
                 "combo_id": combo_id,
@@ -832,6 +1033,7 @@ def evaluate_combos(base_df: pd.DataFrame):
                 "avg_signals_per_day": round(avg_signals_per_day, 2),
                 "selection_rate_pct": round(selection_rate * 100, 4),
                 "selection_penalty": round(selection_penalty, 2),
+                "min_sample_penalty": round(min_sample_penalty, 2),
                 "sample_count_max": sample_count_max,
                 "total_raw_score": round(total_raw, 2),
                 "adjusted_total_raw_score": round(adjusted_total_raw, 2),
@@ -936,6 +1138,9 @@ def main():
     print(f"交易日窗口：{trade_dates[0]} ~ {trade_dates[-1]}，共 {len(trade_dates)} 个交易日")
     print(f"候选信号日：{signal_dates[0]} ~ {signal_dates[-1]}，共 {len(signal_dates)} 个交易日")
     print(f"观察周期：{FORWARD_DAYS} 个交易日")
+    print(
+        f"收益口径：相对{BENCHMARK_INDEX_NAME}({BENCHMARK_INDEX_TS_CODE})超额收益"
+    )
     print(f"评分条件集合：{', '.join(CONDITION_KEYS)}")
 
     stock_pool = load_score_stock_pool()
@@ -983,6 +1188,9 @@ def main():
             f"评分TTM股息率筛选区间：{MIN_DV_TTM}% ~ {MAX_DV_TTM}%"
         )
 
+    index_df = load_benchmark_index_daily(trade_dates)
+    index_forward_lookup = build_index_forward_lookup(index_df, trade_dates)
+
     base_df = build_condition_base_df(
         all_daily,
         stock_info,
@@ -990,6 +1198,7 @@ def main():
         eligible_signal_keys,
         moneyflow_df,
         shareholder_cache_ref,
+        index_forward_lookup,
     )
     if base_df.empty:
         print("没有生成候选信号表，请检查数据窗口、EPS/PE/总市值过滤、ST过滤或股票池")
@@ -1023,9 +1232,12 @@ def main():
         {"key": "signal_date_end", "value": signal_dates[-1]},
         {"key": "forward_days", "value": str(FORWARD_DAYS)},
         {"key": "condition_keys", "value": ", ".join(CONDITION_KEYS)},
+        {"key": "benchmark_index_ts_code", "value": BENCHMARK_INDEX_TS_CODE},
+        {"key": "benchmark_index_name", "value": BENCHMARK_INDEX_NAME},
+        {"key": "return_mode", "value": "超额收益(个股涨跌幅-基准指数涨跌幅)"},
         {"key": "min_dv_ttm", "value": MIN_DV_TTM},
         {"key": "max_dv_ttm", "value": MAX_DV_TTM},
-        {"key": "return_weight_mode", "value": "收益分权重已上调，排名更偏向真实收益兑现"},
+        {"key": "return_weight_mode", "value": "收益分权重已上调，排名更偏向超额收益兑现"},
         {"key": "stock_count_after_st_bj_before_eps_total_mv", "value": len(ts_codes)},
         {"key": "stock_count_after_eps_total_mv_st_bj", "value": candidate_stock_count},
         {"key": "candidate_signal_count_after_eps_total_mv_st_bj", "value": candidate_signal_count},

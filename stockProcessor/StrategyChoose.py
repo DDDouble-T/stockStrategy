@@ -1032,7 +1032,7 @@ def build_display_table(detail_df):
     rows = []
     block_index = {}
 
-    base_df = base_df.sort_values(by=["signal_date", "ts_code"]).reset_index(drop=True)
+    base_df = base_df.sort_values(by=["signal_date", "ts_code"], ascending=[False, True]).reset_index(drop=True)
     for _, row in base_df.iterrows():
         start_row = len(rows)
         block_index[(row["signal_date"], row["ts_code"])] = start_row
@@ -1053,7 +1053,8 @@ def build_display_table(detail_df):
         rows[start_row + 2][price_col] = f"最低价{format_price(row['base_low'])}"
 
     future_df = future_df.sort_values(
-        by=["signal_date", "ts_code", "forward_day"]
+        by=["signal_date", "ts_code", "forward_day"],
+        ascending=[False, True, True]
     ).reset_index(drop=True)
 
     for _, row in future_df.iterrows():

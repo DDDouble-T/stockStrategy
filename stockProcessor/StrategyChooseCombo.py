@@ -25,26 +25,23 @@ STRATEGY_COMBINATIONS = [
             "bullish_ma_alignment",
             "position_rule",
             "volume_rule",
+            "macd_golden_cross",
             "rsi_not_overheated",
             "turnover_rate_range",
-            "main_money_inflow_2days",
-            "volume_ratio_high",
-            "industry_relative_valuation_low",
-            "social_security_holder"
+            "main_money_inflow_2days"
         ],
     },
     {
         "label": "策略2",
         "condition_keys": [
+            "bullish_ma_alignment",
             "position_rule",
             "volume_rule",
             "macd_golden_cross",
             "rsi_not_overheated",
-            "volume_ratio_high",
             "turnover_rate_range",
-            "industry_relative_valuation_low",
-            "prev_year_high_dividend",
-            "main_money_inflow_2days"
+            "main_money_inflow_2days",
+            "prev_year_high_dividend"
         ],
     },
     {
@@ -52,17 +49,14 @@ STRATEGY_COMBINATIONS = [
         "condition_keys": [
             "bullish_ma_alignment",
             "position_rule",
-            "volume_rule",
             "rsi_not_overheated",
             "volume_ratio_high",
-            "external_internal_ratio_high",
             "turnover_rate_range",
             "industry_relative_valuation_low",
             "social_security_holder",
-            "prev_year_high_dividend",
             "main_money_inflow_2days"
         ],
-    },
+    }
 # trend_above_ma20: 股价在20日线之上
     # bullish_ma_alignment: 5日 > 10日 > 20日
     # volume_rule: 上涨放量或回调缩量
@@ -79,7 +73,7 @@ STRATEGY_COMBINATIONS = [
     # main_money_inflow_2days: 主力资金连续流入2天
 ]
 END_DATE = None  # None 表示自动取最近一个 daily + moneyflow 都已就绪的交易日
-TOP_N = 5
+TOP_N = 3
 RESULT_XLSX = score_result_path("strategy_choose_combo_result.xlsx")
 
 
@@ -524,7 +518,7 @@ def build_topn_display_table(detail_df):
     rows = []
     block_index = {}
 
-    base_df = base_df.sort_values(by=["signal_date", "rank", "ts_code"]).reset_index(drop=True)
+    base_df = base_df.sort_values(by=["signal_date", "rank", "ts_code"], ascending=[False, True, True]).reset_index(drop=True)
     for _, row in base_df.iterrows():
         start_row = len(rows)
         block_index[(row["signal_date"], row["ts_code"])] = start_row
@@ -545,7 +539,10 @@ def build_topn_display_table(detail_df):
         rows[start_row + 1][price_col] = f"最高价{format_price(row['base_high'])}"
         rows[start_row + 2][price_col] = f"最低价{format_price(row['base_low'])}"
 
-    future_df = future_df.sort_values(by=["signal_date", "rank", "ts_code", "forward_day"]).reset_index(drop=True)
+    future_df = future_df.sort_values(
+        by=["signal_date", "rank", "ts_code", "forward_day"],
+        ascending=[False, True, True, True]
+    ).reset_index(drop=True)
     for _, row in future_df.iterrows():
         start_row = block_index.get((row["signal_date"], row["ts_code"]))
         if start_row is None:

@@ -23,13 +23,13 @@ DEFAULT_CONFIG = {
     # 突破前高时回看多少个交易日的最高价作为压力位。
     "recent_high_lookback_days": 20,
     # TTM 股息率下限，单位为百分比，2.0 表示 2%。
-    "min_dv_ttm": 2.0,
+    "min_dv_ttm": 1.0,
     # TTM 股息率上限，单位为百分比，6.0 表示 6%。
     "max_dv_ttm": 6.0,
     # 是否启用每股收益 EPS 基础过滤；关闭后不拉取 EPS，也不按 EPS 过滤。
     "enable_eps_filter": True,
     # 每股收益 EPS 基础过滤下限；仅在 enable_eps_filter 为 True 且 eps 有值时生效。
-    "min_eps": 0.2,
+    "min_eps": 0.05,
     # 是否启用总市值基础过滤；关闭后不按 total_mv 过滤。
     "enable_total_mv_filter": True,
     # 总市值基础过滤下限；开启过滤后，按最近一个交易日拉取的 total_mv 过滤。
@@ -118,7 +118,7 @@ STRATEGY_PRESETS = {
     "dividend_quality": {
         "description": "偏股息率质量，保留趋势条件，要求 TTM 股息率在 2%-6% 区间。",
         "signal_days": 15,
-        "min_dv_ttm": 2.0,
+        "min_dv_ttm": 1.0,
         "max_dv_ttm": 6.0,
         "conditions": {
             "volume_ratio_high": False,
