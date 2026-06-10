@@ -1,6 +1,37 @@
 ACTIVE_STRATEGY = "sharechoose"
 
 
+# COMBO_RUN_STATE_START
+COMBO_LAST_RUN_TRADE_DATE = '20260610'
+COMBO_LAST_RUN_STRATEGY_COMBINATIONS = [{'label': '策略1',
+  'condition_keys': ['bullish_ma_alignment',
+                     'position_rule',
+                     'volume_rule',
+                     'macd_golden_cross',
+                     'rsi_not_overheated',
+                     'turnover_rate_range',
+                     'main_money_inflow_2days']},
+ {'label': '策略2',
+  'condition_keys': ['bullish_ma_alignment',
+                     'position_rule',
+                     'volume_rule',
+                     'macd_golden_cross',
+                     'rsi_not_overheated',
+                     'turnover_rate_range',
+                     'main_money_inflow_2days',
+                     'prev_year_high_dividend']},
+ {'label': '策略3',
+  'condition_keys': ['bullish_ma_alignment',
+                     'position_rule',
+                     'rsi_not_overheated',
+                     'volume_ratio_high',
+                     'turnover_rate_range',
+                     'industry_relative_valuation_low',
+                     'social_security_holder',
+                     'main_money_inflow_2days']}]
+# COMBO_RUN_STATE_END
+
+
 DEFAULT_CONFIG = {
     # 拉取最近多少个交易日的日线数据；需覆盖指标计算、信号筛选和后续表现回看窗口。
     "data_lookback_trade_days": 120,

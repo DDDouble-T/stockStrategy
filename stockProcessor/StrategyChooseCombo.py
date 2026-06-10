@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from pprint import pformat
 
 import numpy as np
 import pandas as pd
@@ -90,6 +91,59 @@ def validate_condition_keys(condition_keys):
     invalid_keys = [key for key in condition_keys if key not in valid_keys]
     if invalid_keys:
         raise ValueError(f"存在无效条件 key: {', '.join(invalid_keys)}")
+
+
+def normalize_strategy_combinations(combos):
+    return [
+        {
+            "label": combo.get("label", ""),
+            "condition_keys": list(combo.get("condition_keys", [])),
+        }
+        for combo in combos
+    ]
+
+
+def should_skip_current_run(end_date):
+    last_run_trade_date = str(getattr(strategy_choose_config, "COMBO_LAST_RUN_TRADE_DATE", "") or "")
+    last_run_combos = getattr(strategy_choose_config, "COMBO_LAST_RUN_STRATEGY_COMBINATIONS", [])
+    current_combos = normalize_strategy_combinations(STRATEGY_COMBINATIONS)
+
+    if last_run_trade_date == str(end_date) and last_run_combos == current_combos:
+        print(f"组合策略已在最近交易日 {end_date} 运行过，且策略组合未变化，跳过本次运行。")
+        print(f"结果文件：{RESULT_XLSX}")
+        return True
+    return False
+
+
+def save_combo_run_config(end_date):
+    config_path = strategy_choose_config.__file__
+    start_marker = "# COMBO_RUN_STATE_START"
+    end_marker = "# COMBO_RUN_STATE_END"
+    current_combos = normalize_strategy_combinations(STRATEGY_COMBINATIONS)
+    state_block = (
+        f"{start_marker}\n"
+        f"COMBO_LAST_RUN_TRADE_DATE = {str(end_date)!r}\n"
+        "COMBO_LAST_RUN_STRATEGY_COMBINATIONS = "
+        f"{pformat(current_combos, width=120, sort_dicts=False)}\n"
+        f"{end_marker}\n"
+    )
+
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        content = config_file.read()
+
+    start_index = content.find(start_marker)
+    end_index = content.find(end_marker)
+    if start_index >= 0 and end_index >= start_index:
+        end_index += len(end_marker)
+        content = content[:start_index] + state_block.rstrip("\n") + content[end_index:]
+    else:
+        content = content.rstrip() + "\n\n\n" + state_block
+
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        config_file.write(content.rstrip() + "\n")
+
+    strategy_choose_config.COMBO_LAST_RUN_TRADE_DATE = str(end_date)
+    strategy_choose_config.COMBO_LAST_RUN_STRATEGY_COMBINATIONS = current_combos
 
 
 def build_runtime_config(combo):
@@ -706,6 +760,9 @@ def main():
         raise ValueError("STRATEGY_COMBINATIONS 至少需要配置一个策略组合")
 
     end_date = resolve_common_end_date(STRATEGY_COMBINATIONS)
+    if should_skip_current_run(end_date):
+        return
+
     strategy_frames = []
     runtime_configs = []
 
@@ -717,6 +774,7 @@ def main():
     merged_detail_df, merged_base_df = merge_strategy_details(strategy_frames, STRATEGY_COMBINATIONS)
     if merged_base_df.empty:
         print("所有策略组合均未筛选出结果，未生成横向收益表")
+        save_combo_run_config(end_date)
         return
 
     ranked_base_df = score_merged_stocks(merged_base_df, runtime_configs, end_date)
@@ -754,6 +812,7 @@ def main():
     print(f"\n合并策略结果已输出：{RESULT_XLSX}")
     print(f"合并后唯一信号数：{len(merged_base_df)}")
     print(f"每日 Top{TOP_N} 记录数：{len(topn_base_df)}")
+    save_combo_run_config(end_date)
 
 
 if __name__ == "__main__":
