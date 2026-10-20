@@ -115,6 +115,23 @@ def should_skip_current_run(end_date):
     return False
 
 
+def summarize_new_topn_results(topn_base_df, end_date, last_run_trade_date):
+    current_end_date = str(end_date)
+    previous_end_date = str(last_run_trade_date or "")
+    if previous_end_date and current_end_date <= previous_end_date:
+        return [], 0
+
+    signal_dates = topn_base_df["signal_date"].astype(str)
+    new_date_mask = signal_dates > previous_end_date if previous_end_date else pd.Series(
+        True,
+        index=topn_base_df.index,
+    )
+    new_dates = set(signal_dates[new_date_mask])
+    # 即使新增交易日没有入选结果，也应明确打印该日期及 0 条结果。
+    new_dates.add(current_end_date)
+    return sorted(new_dates), int(new_date_mask.sum())
+
+
 def save_combo_run_config(end_date):
     config_path = strategy_choose_config.__file__
     start_marker = "# COMBO_RUN_STATE_START"
@@ -760,6 +777,7 @@ def main():
         raise ValueError("STRATEGY_COMBINATIONS 至少需要配置一个策略组合")
 
     end_date = resolve_common_end_date(STRATEGY_COMBINATIONS)
+    last_run_trade_date = getattr(strategy_choose_config, "COMBO_LAST_RUN_TRADE_DATE", "")
     if should_skip_current_run(end_date):
         return
 
@@ -812,6 +830,13 @@ def main():
     print(f"\n合并策略结果已输出：{RESULT_XLSX}")
     print(f"合并后唯一信号数：{len(merged_base_df)}")
     print(f"每日 Top{TOP_N} 记录数：{len(topn_base_df)}")
+    new_dates, new_result_count = summarize_new_topn_results(
+        topn_base_df,
+        end_date,
+        last_run_trade_date,
+    )
+    print(f"新增日期：{'、'.join(new_dates) if new_dates else '无'}")
+    print(f"新增结果数量：{new_result_count}")
     save_combo_run_config(end_date)
 
 

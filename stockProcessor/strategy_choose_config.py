@@ -2,7 +2,7 @@ ACTIVE_STRATEGY = "sharechoose"
 
 
 # COMBO_RUN_STATE_START
-COMBO_LAST_RUN_TRADE_DATE = '20260610'
+COMBO_LAST_RUN_TRADE_DATE = '20261019'
 COMBO_LAST_RUN_STRATEGY_COMBINATIONS = [{'label': '策略1',
   'condition_keys': ['bullish_ma_alignment',
                      'position_rule',

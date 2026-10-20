@@ -17,7 +17,7 @@ import strategy_choose_config
 # 可选值：
 # - download：保留现有缓存，只补缺失/不完整的 EPS
 # - update：按当前区间全部重下 EPS
-RUN_MODE = "download"
+RUN_MODE = "update"
 END_DATE = None
 # 仅在 RUN_MODE = "update" 时生效。
 # None / ""：从基础面缓存中的最早 trade_date 开始更新。
